@@ -114,6 +114,22 @@ playwright install
 
 > **Nota:** Edge deve essere già presente su Windows. Il programma lo individua automaticamente in `Program Files` o `LocalAppData`.
 
+### 5. Creare il file degli shortcut (obbligatorio al primo avvio)
+
+Il repository **non** include `saved_shortcuts.json` (è personale e ignorato da Git). Devi crearlo tu una sola volta, partendo dall'esempio:
+
+1. Nella cartella del progetto, trova il file `saved_shortcuts.example.json`.
+2. Copialo e rinomina la copia in `saved_shortcuts.json`:
+
+```powershell
+Copy-Item saved_shortcuts.example.json saved_shortcuts.json
+```
+
+3. (Opzionale) Apri `saved_shortcuts.json` con un editor di testo e sostituisci gli UUID/nomi di esempio con i tuoi shortcut Proligent.
+4. Salva il file. Da questo momento la GUI userà e aggiornerà automaticamente `saved_shortcuts.json`.
+
+> **Importante:** non modificare né committare `saved_shortcuts.example.json` con i tuoi dati reali. Quello resta solo come modello per gli altri utenti. I tuoi shortcut vanno solo in `saved_shortcuts.json`.
+
 ---
 
 ## Avvio del programma
@@ -314,15 +330,35 @@ Dopo aver creato la tabella con i filtri desiderati premenre il tasto **Actions*
 3. Cliccare **Carica**.
 4. Il programma apre la pagina Discovery in background, scorre tutte le pagine del report SSRS e carica i dati nella griglia, tab **Dati**.
 
-### Salvare e gestire gli shortcut
+### Configurare il file degli shortcut (cosa deve fare l'utente)
+
+Due file diversi — non confonderli:
+
+| File | Ruolo | Cosa fare |
+|---|---|---|
+| `saved_shortcuts.example.json` | Modello di esempio **nel repository** | Solo da leggere / copiare. Non inserire qui i tuoi UUID reali. |
+| `saved_shortcuts.json` | Elenco **locale** dei tuoi shortcut | Devi crearlo tu (copia dall'esempio). Qui salvi i tuoi UUID. Non viene committato in Git. |
+
+**Cosa fare al primo utilizzo**
+
+1. Se non hai ancora `saved_shortcuts.json`, crealo come descritto in [Installazione §5](#5-creare-il-file-degli-shortcut-obbligatorio-al-primo-avvio):
+   ```powershell
+   Copy-Item saved_shortcuts.example.json saved_shortcuts.json
+   ```
+2. Apri `saved_shortcuts.json` e sostituisci gli esempi con i tuoi UUID Proligent (oppure lascia il file vuoto `[]` e aggiungi tutto dalla GUI).
+3. Avvia il programma: nel menu a tendina **Shortcut** vedrai gli elementi presenti nel file.
+
+**Cosa fare nell'uso quotidiano (dalla GUI)**
 
 | Azione | Come |
 |---|---|
 | **Salvare** | Inserire UUID + nome opzionale nel campo "Nome per questo shortcut", poi **Salva** |
 | **Aggiornare** | Selezionare uno shortcut esistente, modificare il nome, **Salva** |
-| **Eliminare** | Selezionare lo shortcut dall' elenco e cliccare **Elimina** |
+| **Eliminare** | Selezionare lo shortcut dall'elenco e cliccare **Elimina** |
 
-Gli shortcut salvati vengono memorizzati in `saved_shortcuts.json`:
+Ogni salvataggio/eliminazione dalla GUI aggiorna automaticamente `saved_shortcuts.json` sul tuo PC. Non serve toccare Git.
+
+Formato atteso del file:
 
 ```json
 [
@@ -472,7 +508,8 @@ proligent-parser/
 ├── gui.py                     # Interfaccia grafica PySide6
 ├── main.py                    # Entry point riga di comando
 ├── requirements.txt           # Dipendenze Python
-├── saved_shortcuts.json       # Shortcut UUID salvati dall'utente
+├── saved_shortcuts.example.json  # Esempio di shortcut UUID (committato)
+├── saved_shortcuts.json          # Shortcut locali dell'utente (gitignored)
 ├── .proligent-browser-data/       # Profilo Edge (sessione, cookie) — generato
 ├── .proligent-browser-data-viewer/  # Profilo Edge per Unit Results View
 └── logs/                      # Log giornalieri del launcher (launcher_AAAAMMGG.log)
@@ -525,9 +562,17 @@ Il client disabilita la verifica SSL (`verify=False`) perché il server Proligen
 
 Gli shortcut con molte pagine richiedono la navigazione automatica di ogni pagina Discovery. L'overlay nella GUI mostra l'avanzamento (*Raccolta pagina X di Y…*). Attendere il completamento.
 
-### Certificato o permessi su `saved_shortcuts.json`
+### Manca `saved_shortcuts.json` / shortcut non compaiono nel menu
 
-Il file viene creato/aggiornato automaticamente dalla GUI. Se manca, crearlo manualmente come array JSON vuoto: `[]`.
+Il file non è incluso nel repository: ogni utente deve crearlo in locale.
+
+1. Nella cartella del progetto esegui:
+   ```powershell
+   Copy-Item saved_shortcuts.example.json saved_shortcuts.json
+   ```
+2. Se preferisci partire da zero, crea invece un file `saved_shortcuts.json` con contenuto `[]`.
+3. Riavvia la GUI: gli shortcut (se presenti nel file) appariranno nel menu a tendina.
+4. Se il file esiste ma non si aggiorna, verifica i permessi di scrittura sulla cartella del progetto.
 
 ---
 
