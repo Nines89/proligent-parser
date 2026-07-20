@@ -190,6 +190,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QCompleter,
     QDateEdit,
     QDialog,
     QDialogButtonBox,
@@ -197,6 +198,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
     QGridLayout,
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -217,6 +219,7 @@ from PySide6.QtWidgets import (
 )
 
 _SAVED_SHORTCUTS_FILE = Path(__file__).parent / "saved_shortcuts.json"
+_SAVED_WAREHOUSE_FILE = Path(__file__).parent / "saved_warehouse_queries.json"
 
 FONT_FAMILY = "Segoe UI"
 FONT_SIZE_TABLE = 13
@@ -551,10 +554,14 @@ class MainWindow(QMainWindow):
         self.resize(1500, 900)
 
         self._client = None
+        self._wh_client = None
         self._logged_in = False
+        self._wh_connected = False
         self._downloading = False
         self._current_df = pd.DataFrame()
         self._col_uniq: dict[int, list[str]] = {}
+        self._meas_names: list[str] = []
+        self._meas_col_idx: int | None = None
 
         self._build_ui()
         self._overlay = LoadingOverlay(self.centralWidget())
@@ -737,9 +744,161 @@ class MainWindow(QMainWindow):
         v2.addLayout(row2)
 
         self._tabs.addTab(t2, "  Shortcut UUID  ")
+
+        # Tab: Warehouse DB (proligent_db_sdk / SQL)
+        t3 = QWidget()
+        v3 = QVBoxLayout(t3)
+        v3.setContentsMargins(12, 12, 12, 8)
+        v3.setSpacing(8)
+
+        # Saved warehouse searches row
+        wh_saved_row = QHBoxLayout()
+        wh_saved_row.setSpacing(10)
+        lbl_wh_saved = QLabel("Ricerche salvate:")
+        lbl_wh_saved.setStyleSheet("font-size:13px; color:#424242;")
+        wh_saved_row.addWidget(lbl_wh_saved)
+
+        self._cmb_wh_saved = QComboBox()
+        self._cmb_wh_saved.setEditable(False)
+        self._cmb_wh_saved.setStyleSheet(
+            "font-size:13px; padding:6px 8px; color:#212121; background:white;"
+        )
+        self._cmb_wh_saved.setMinimumWidth(320)
+        wh_saved_row.addWidget(self._cmb_wh_saved, stretch=1)
+
+        self._txt_wh_label = QLineEdit()
+        self._txt_wh_label.setPlaceholderText("Nome ricerca (opzionale)")
+        self._txt_wh_label.setStyleSheet(
+            "font-size:13px; padding:4px 6px; color:#212121; background:white;"
+        )
+        wh_saved_row.addWidget(self._txt_wh_label, stretch=1)
+
+        self._btn_wh_save = QPushButton("  Salva  ")
+        self._btn_wh_save.setStyleSheet(
+            "font-size:12px; font-weight:bold; padding:5px 18px;"
+            "background:#2e7d32; color:white; border:none; border-radius:3px;"
+        )
+        wh_saved_row.addWidget(self._btn_wh_save)
+
+        self._btn_wh_del = QPushButton("  Elimina  ")
+        self._btn_wh_del.setStyleSheet(
+            "font-size:12px; font-weight:bold; padding:5px 18px;"
+            "background:#c62828; color:white; border:none; border-radius:3px;"
+        )
+        wh_saved_row.addWidget(self._btn_wh_del)
+        v3.addLayout(wh_saved_row)
+
+        g3 = QGridLayout()
+        g3.setSpacing(8)
+        v3.addLayout(g3)
+
+        self._cmb_wh_type = QComboBox()
+        self._cmb_wh_type.addItems(["Operation runs (+ docs)", "Measurements"])
+        self._txt_wh_product = QLineEdit()
+        self._txt_wh_product.setPlaceholderText("es. 3TL04228AA")
+        self._txt_wh_serial = QLineEdit()
+        self._txt_wh_serial.setPlaceholderText("serial number")
+        self._txt_wh_operation = QLineEdit()
+        self._txt_wh_operation.setPlaceholderText("es. 08000 - FUNCTIONAL TEST")
+        self._txt_wh_station = QLineEdit()
+        self._txt_wh_station.setPlaceholderText("location / station (partial OK)")
+        self._txt_wh_operator = QLineEdit()
+        self._txt_wh_operator.setPlaceholderText("operator id / name (partial OK)")
+        self._cmb_wh_status = QComboBox()
+        self._cmb_wh_status.addItems(["(tutti)", "PASS", "FAIL", "ABORTED"])
+        self._spn_wh_top = QSpinBox()
+        self._spn_wh_top.setRange(0, 500_000)
+        self._spn_wh_top.setValue(10_000)
+        self._spn_wh_top.setSpecialValueText("Illimitato")
+
+        _WH_FIELD_CSS = (
+            "font-size:13px; padding:4px 6px; color:#212121; background:white;"
+        )
+        for w in (
+            self._cmb_wh_type, self._txt_wh_product, self._txt_wh_serial,
+            self._txt_wh_operation, self._txt_wh_station, self._txt_wh_operator,
+            self._cmb_wh_status, self._spn_wh_top,
+        ):
+            w.setStyleSheet(_WH_FIELD_CSS)
+
+        self._date_wh_from = QDateEdit()
+        self._date_wh_from.setCalendarPopup(True)
+        self._date_wh_from.setDisplayFormat("yyyy-MM-dd")
+        self._date_wh_from.setDate(QDate.currentDate().addMonths(-1))
+        self._date_wh_to = QDateEdit()
+        self._date_wh_to.setCalendarPopup(True)
+        self._date_wh_to.setDisplayFormat("yyyy-MM-dd")
+        self._date_wh_to.setDate(QDate.currentDate())
+        self._chk_wh_dates = QCheckBox("Filtra per data")
+        self._chk_wh_dates.setChecked(False)
+        self._chk_wh_dates.setStyleSheet("font-size:12px; color:#424242;")
+        self._date_wh_from.setEnabled(False)
+        self._date_wh_to.setEnabled(False)
+
+        wh_fields = [
+            (0, 0, "Tipo:", self._cmb_wh_type),
+            (0, 2, "Prodotto:", self._txt_wh_product),
+            (0, 4, "Serial:", self._txt_wh_serial),
+            (0, 6, "Operazione:", self._txt_wh_operation),
+            (1, 0, "Stazione:", self._txt_wh_station),
+            (1, 2, "Operatore:", self._txt_wh_operator),
+            (1, 4, "Status:", self._cmb_wh_status),
+            (1, 6, "Max righe:", self._spn_wh_top),
+            (2, 2, "Data da:", self._date_wh_from),
+            (2, 4, "Data a:", self._date_wh_to),
+        ]
+        for row, col, label, widget in wh_fields:
+            lbl = QLabel(label)
+            lbl.setStyleSheet("font-size:13px; color:#424242;")
+            g3.addWidget(lbl, row, col)
+            g3.addWidget(widget, row, col + 1)
+
+        g3.addWidget(self._chk_wh_dates, 2, 0, 1, 2)
+
+        self._chk_wh_latest = QCheckBox("Solo ultimo passaggio per serial")
+        self._chk_wh_latest.setStyleSheet("font-size:12px; color:#424242;")
+        g3.addWidget(self._chk_wh_latest, 3, 0, 1, 2)
+
+        self._chk_wh_product_like = QCheckBox("Prodotto LIKE")
+        self._chk_wh_product_like.setChecked(True)
+        self._chk_wh_product_like.setStyleSheet("font-size:12px; color:#424242;")
+        g3.addWidget(self._chk_wh_product_like, 3, 2, 1, 2)
+
+        wh_btn_col = QVBoxLayout()
+        self._btn_wh_connect = QPushButton("  Connetti DB  ")
+        self._btn_wh_connect.setStyleSheet(
+            "font-size:13px; font-weight:bold; padding:8px 18px;"
+            "background:#1565c0; color:white; border:none; border-radius:4px;"
+        )
+        self._btn_wh_query = QPushButton("  Esegui Warehouse  ")
+        self._btn_wh_query.setEnabled(False)
+        self._btn_wh_query.setStyleSheet(
+            "font-size:14px; font-weight:bold; padding:12px 22px;"
+            "background:#2e7d32; color:white; border:none; border-radius:4px;"
+        )
+        wh_btn_col.addWidget(self._btn_wh_connect)
+        wh_btn_col.addWidget(self._btn_wh_query)
+        wh_btn_col.addStretch()
+        g3.addLayout(wh_btn_col, 0, 8, 4, 1)
+
+        self._lbl_wh_status = QLabel("  Warehouse: non connesso (Windows auth)")
+        self._lbl_wh_status.setStyleSheet("font-size:12px; color:#757575;")
+        v3.addWidget(self._lbl_wh_status)
+
+        wh_hint = QLabel(
+            "Query diretta sul data warehouse SQL — ideale per migliaia di righe. "
+            "Salva le combinazioni di filtri per riutilizzarle. "
+            "Di default non si applica filtro date (tutte le date disponibili)."
+        )
+        wh_hint.setStyleSheet("font-size:12px; color:#9e9e9e; font-style:italic;")
+        wh_hint.setWordWrap(True)
+        v3.addWidget(wh_hint)
+
+        self._tabs.addTab(t3, "  Warehouse DB  ")
         self._tabs.tabBar().setVisible(self._tabs.count() > 1)
 
         self._load_saved_shortcuts()
+        self._load_saved_warehouse_queries()
 
         # ── Toolbar: date filters ──
         date_row = QHBoxLayout()
@@ -809,6 +968,52 @@ class MainWindow(QMainWindow):
 
         date_row.addStretch()
         root.addLayout(date_row)
+
+        # ── Toolbar: MeasurementName (enabled only after a search with that column) ──
+        meas_row = QHBoxLayout()
+        meas_row.setSpacing(6)
+        lbl_meas = QLabel("MeasurementName:")
+        lbl_meas.setStyleSheet("font-size:12px; color:#424242;")
+        meas_row.addWidget(lbl_meas)
+
+        self._cmb_meas_name = QComboBox()
+        self._cmb_meas_name.setEditable(True)
+        self._cmb_meas_name.setInsertPolicy(QComboBox.NoInsert)
+        self._cmb_meas_name.setEnabled(False)
+        self._cmb_meas_name.setMinimumWidth(320)
+        self._cmb_meas_name.addItem("(tutti)")
+        self._cmb_meas_name.lineEdit().setPlaceholderText(
+            "Disponibile dopo una ricerca Measurements"
+        )
+        self._cmb_meas_name.setStyleSheet(
+            "font-size:12px; padding:4px 6px; color:#212121; background:white;"
+        )
+        meas_row.addWidget(self._cmb_meas_name, stretch=1)
+
+        self._btn_meas_multi = QPushButton("Seleziona…")
+        self._btn_meas_multi.setEnabled(False)
+        self._btn_meas_multi.setToolTip(
+            "Scegli uno o più MeasurementName tra quelli letti dalla query"
+        )
+        self._btn_meas_multi.setStyleSheet(
+            "font-size:11px; padding:4px 10px; color:#212121; background:#e3f2fd;"
+            " border:1px solid #90caf9; border-radius:3px;"
+        )
+        meas_row.addWidget(self._btn_meas_multi)
+
+        self._btn_meas_clear = QPushButton("Tutti i meas.")
+        self._btn_meas_clear.setEnabled(False)
+        self._btn_meas_clear.setStyleSheet(
+            "font-size:11px; padding:4px 10px; color:#424242; background:#e0e0e0;"
+            " border:1px solid #bdbdbd; border-radius:3px;"
+        )
+        meas_row.addWidget(self._btn_meas_clear)
+
+        self._lbl_meas_info = QLabel("")
+        self._lbl_meas_info.setStyleSheet("font-size:11px; color:#9e9e9e;")
+        meas_row.addWidget(self._lbl_meas_info)
+        meas_row.addStretch()
+        root.addLayout(meas_row)
 
         # ── Toolbar: grid filters + export ──
         tb = QHBoxLayout()
@@ -926,6 +1131,12 @@ class MainWindow(QMainWindow):
         self._btn_login.clicked.connect(self._on_login)
         self._btn_query.clicked.connect(self._on_query)
         self._btn_shortcut.clicked.connect(self._on_shortcut)
+        self._btn_wh_connect.clicked.connect(self._on_wh_connect)
+        self._btn_wh_query.clicked.connect(self._on_wh_query)
+        self._btn_wh_save.clicked.connect(self._on_save_warehouse_query)
+        self._btn_wh_del.clicked.connect(self._on_del_warehouse_query)
+        self._cmb_wh_saved.currentIndexChanged.connect(self._on_wh_saved_selected)
+        self._chk_wh_dates.toggled.connect(self._on_wh_dates_toggled)
         self._btn_save_sc.clicked.connect(self._on_save_shortcut)
         self._btn_del_sc.clicked.connect(self._on_del_shortcut)
         self._btn_export.clicked.connect(self._on_export)
@@ -935,6 +1146,9 @@ class MainWindow(QMainWindow):
         self._btn_24h.clicked.connect(lambda: self._quick_date_filter(1))
         self._btn_7d.clicked.connect(lambda: self._quick_date_filter(7))
         self._btn_30d.clicked.connect(lambda: self._quick_date_filter(30))
+        self._cmb_meas_name.currentTextChanged.connect(self._on_meas_name_combo)
+        self._btn_meas_multi.clicked.connect(self._on_meas_name_multi)
+        self._btn_meas_clear.clicked.connect(self._clear_meas_name_filter)
         self._login_done.connect(self._login_result)
         self._query_done.connect(self._query_result)
         self._progress_msg.connect(self._overlay.set_message)
@@ -950,6 +1164,18 @@ class MainWindow(QMainWindow):
             from proligent_client import ProligentClient
             self._client = ProligentClient()
         return self._client
+
+    def _get_wh_client(self):
+        if self._wh_client is None:
+            from warehouse_client import WarehouseClient
+            self._wh_client = WarehouseClient()
+        return self._wh_client
+
+    def _set_query_buttons_enabled(self, enabled: bool) -> None:
+        self._btn_query.setEnabled(enabled and self._logged_in)
+        self._btn_shortcut.setEnabled(enabled and self._logged_in)
+        self._btn_wh_query.setEnabled(enabled and self._wh_connected)
+        self._btn_wh_connect.setEnabled(enabled)
 
     def _ensure_dashboard(self) -> None:
         if self._dashboard is not None:
@@ -987,8 +1213,7 @@ class MainWindow(QMainWindow):
             self._logged_in = True
             self._lbl_login.setText("  Connesso")
             self._lbl_login.setStyleSheet("font-size:14px; color:#2e7d32; font-weight:bold;")
-            self._btn_query.setEnabled(True)
-            self._btn_shortcut.setEnabled(True)
+            self._set_query_buttons_enabled(True)
         else:
             self._lbl_login.setText("  Errore")
             self._lbl_login.setStyleSheet("font-size:14px; color:red;")
@@ -1007,8 +1232,7 @@ class MainWindow(QMainWindow):
     def _run(self, fn) -> None:
         if not self._logged_in:
             return
-        self._btn_query.setEnabled(False)
-        self._btn_shortcut.setEnabled(False)
+        self._set_query_buttons_enabled(False)
         self._statusbar.showMessage("Query in corso...")
         self._overlay.show_loading("Esecuzione query…")
         self._pfn = fn
@@ -1095,13 +1319,16 @@ class MainWindow(QMainWindow):
     @Slot(object, str)
     def _query_result(self, df: pd.DataFrame | None, err: str) -> None:
         self._overlay.hide_loading()
-        self._btn_query.setEnabled(self._logged_in)
-        self._btn_shortcut.setEnabled(self._logged_in)
         try:
+            if err and err.startswith("__WH_"):
+                self._handle_wh_connect_result(df, err)
+                return
             self._apply_query_result(df, err)
         except Exception as e:
             self._statusbar.showMessage(f"Errore: {e}", 10000)
             QMessageBox.warning(self, "Errore", str(e))
+        finally:
+            self._set_query_buttons_enabled(True)
 
     def _apply_query_result(self, df: pd.DataFrame | None, err: str) -> None:
         if err:
@@ -1111,6 +1338,7 @@ class MainWindow(QMainWindow):
         if df is None or df.empty:
             self._statusbar.showMessage("Nessun dato.", 5000)
             QMessageBox.information(self, "Risultato", "Nessun dato trovato.")
+            self._refresh_meas_name_filter(pd.DataFrame())
             return
 
         # Sort by Start Time descending (most recent first)
@@ -1136,7 +1364,7 @@ class MainWindow(QMainWindow):
         h = self._table.horizontalHeader()
         for i in range(self._model.columnCount()):
             col_name = str(df.columns[i]) if i < len(df.columns) else ""
-            if col_name in ("_download_url", "_unit_view"):
+            if col_name in ("_download_url", "_unit_view", "Document URL"):
                 self._table.setColumnHidden(i, True)
             else:
                 w = h.sectionSize(i)
@@ -1145,7 +1373,397 @@ class MainWindow(QMainWindow):
         self._upd_count()
         if self._dashboard is not None:
             self._dashboard.update_data(self._current_df)
+        self._refresh_meas_name_filter(df)
         self._statusbar.showMessage(f"Caricati {len(df)} record (piu' recenti prima).", 5000)
+
+    def _find_meas_name_col(self, df: pd.DataFrame | None = None) -> str | None:
+        src = df if df is not None else self._current_df
+        if src is None or src.empty:
+            return None
+        for c in src.columns:
+            if str(c).lower() == "measurementname":
+                return str(c)
+        return None
+
+    def _refresh_meas_name_filter(self, df: pd.DataFrame | None = None) -> None:
+        """Populate MeasurementName choices from the latest query result."""
+        src = df if df is not None else self._current_df
+        col = self._find_meas_name_col(src)
+        self._cmb_meas_name.blockSignals(True)
+        self._cmb_meas_name.clear()
+        self._cmb_meas_name.addItem("(tutti)")
+        self._meas_names = []
+        self._meas_col_idx = None
+
+        if col is None or src is None or src.empty:
+            self._cmb_meas_name.setEnabled(False)
+            self._btn_meas_multi.setEnabled(False)
+            self._btn_meas_clear.setEnabled(False)
+            self._lbl_meas_info.setText("Nessun MeasurementName in questo risultato")
+            self._cmb_meas_name.blockSignals(False)
+            return
+
+        names = sorted(
+            {
+                str(v)
+                for v in src[col].dropna().tolist()
+                if str(v).strip() and str(v).lower() != "nan"
+            },
+            key=str.lower,
+        )
+        self._meas_names = names
+        self._meas_col_idx = list(src.columns).index(col)
+        self._cmb_meas_name.addItems(names)
+        completer = QCompleter(names, self._cmb_meas_name)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        self._cmb_meas_name.setCompleter(completer)
+        self._cmb_meas_name.setEnabled(True)
+        self._btn_meas_multi.setEnabled(True)
+        self._btn_meas_clear.setEnabled(True)
+        self._lbl_meas_info.setText(f"{len(names)} MeasurementName dalla query")
+        self._cmb_meas_name.setCurrentIndex(0)
+        self._cmb_meas_name.blockSignals(False)
+
+    def _apply_meas_name_filter(self, allowed: set[str] | None) -> None:
+        if self._meas_col_idx is None:
+            return
+        self._proxy.set_column_allowed(self._meas_col_idx, allowed)
+        self._upd_count()
+        self._upd_filt()
+        if allowed is None:
+            self._statusbar.showMessage("Filtro MeasurementName rimosso", 3000)
+        else:
+            self._statusbar.showMessage(
+                f"Filtro MeasurementName: {len(allowed)} selezionati", 4000
+            )
+
+    @Slot(str)
+    def _on_meas_name_combo(self, text: str) -> None:
+        if not self._cmb_meas_name.isEnabled():
+            return
+        text = (text or "").strip()
+        if not text or text == "(tutti)":
+            self._apply_meas_name_filter(None)
+            return
+        # Only apply when the typed/selected value exists in the query catalog.
+        if text in self._meas_names:
+            self._apply_meas_name_filter({text})
+
+    @Slot()
+    def _on_meas_name_multi(self) -> None:
+        if not self._meas_names or self._meas_col_idx is None:
+            return
+        active = self._proxy.get_active_filters().get(self._meas_col_idx)
+        dlg = FilterDialog("MeasurementName", self._meas_names, active, self)
+        if dlg.exec() == QDialog.Accepted:
+            vals = dlg.result_values
+            if vals is None or len(vals) >= len(self._meas_names):
+                self._cmb_meas_name.blockSignals(True)
+                self._cmb_meas_name.setCurrentIndex(0)
+                self._cmb_meas_name.blockSignals(False)
+                self._apply_meas_name_filter(None)
+            elif len(vals) == 1:
+                only = next(iter(vals))
+                self._cmb_meas_name.blockSignals(True)
+                idx = self._cmb_meas_name.findText(only)
+                if idx >= 0:
+                    self._cmb_meas_name.setCurrentIndex(idx)
+                else:
+                    self._cmb_meas_name.setCurrentText(only)
+                self._cmb_meas_name.blockSignals(False)
+                self._apply_meas_name_filter(vals)
+            else:
+                self._cmb_meas_name.blockSignals(True)
+                self._cmb_meas_name.setCurrentText(f"({len(vals)} selezionati)")
+                self._cmb_meas_name.blockSignals(False)
+                self._apply_meas_name_filter(vals)
+
+    @Slot()
+    def _clear_meas_name_filter(self) -> None:
+        self._cmb_meas_name.blockSignals(True)
+        self._cmb_meas_name.setCurrentIndex(0)
+        self._cmb_meas_name.blockSignals(False)
+        self._apply_meas_name_filter(None)
+
+    # ── Warehouse DB ──
+
+    @Slot(bool)
+    def _on_wh_dates_toggled(self, checked: bool) -> None:
+        self._date_wh_from.setEnabled(checked)
+        self._date_wh_to.setEnabled(checked)
+
+    @Slot()
+    def _on_wh_connect(self) -> None:
+        self._set_query_buttons_enabled(False)
+        self._lbl_wh_status.setText("  Warehouse: connessione…")
+        self._lbl_wh_status.setStyleSheet("font-size:12px; color:#757575;")
+        self._overlay.show_loading("Connessione al warehouse SQL…")
+        threading.Thread(target=self._do_wh_connect, daemon=True).start()
+
+    def _do_wh_connect(self) -> None:
+        try:
+            self._get_wh_client().connect()
+            self._query_done.emit(pd.DataFrame(), "__WH_OK__")
+        except Exception as e:
+            self._query_done.emit(None, f"__WH_ERR__{e}")
+
+    @Slot()
+    def _on_wh_query(self) -> None:
+        if not self._wh_connected:
+            return
+        product = self._txt_wh_product.text().strip()
+        serial = self._txt_wh_serial.text().strip()
+        operation = self._txt_wh_operation.text().strip()
+        station = self._txt_wh_station.text().strip()
+        operator = self._txt_wh_operator.text().strip()
+        if not any((product, serial, operation, station, operator)):
+            QMessageBox.warning(
+                self,
+                "Filtri richiesti",
+                "Imposta almeno un filtro (prodotto, serial, operazione, "
+                "stazione o operatore) per evitare estrazioni enormi.",
+            )
+            return
+
+        self._set_query_buttons_enabled(False)
+        self._statusbar.showMessage("Warehouse query in corso...")
+        self._overlay.show_loading("Query warehouse SQL…")
+        threading.Thread(target=self._do_wh_query, daemon=True).start()
+
+    def _do_wh_query(self) -> None:
+        try:
+            wh = self._get_wh_client()
+            qtype = self._cmb_wh_type.currentText()
+            if self._chk_wh_dates.isChecked():
+                date_from = self._date_wh_from.date().toString("yyyy-MM-dd")
+                date_to = self._date_wh_to.date().toString("yyyy-MM-dd")
+            else:
+                date_from = None
+                date_to = None
+            common = dict(
+                product=self._txt_wh_product.text().strip() or None,
+                serial=self._txt_wh_serial.text().strip() or None,
+                operation=self._txt_wh_operation.text().strip() or None,
+                station=self._txt_wh_station.text().strip() or None,
+                date_from=date_from,
+                date_to=date_to,
+            )
+            self._progress_msg.emit("Esecuzione query SQL sul warehouse…")
+            if qtype.startswith("Measurements"):
+                df = wh.fetch_measurements(**common)
+            else:
+                st = self._cmb_wh_status.currentText().strip()
+                top = self._spn_wh_top.value()
+                df = wh.fetch_operation_runs(
+                    **common,
+                    operator=self._txt_wh_operator.text().strip() or None,
+                    status=None if st == "(tutti)" else st,
+                    top=top if top > 0 else None,
+                    product_like=self._chk_wh_product_like.isChecked(),
+                    latest_passage_only=self._chk_wh_latest.isChecked(),
+                )
+            self._query_done.emit(df, "")
+        except Exception as e:
+            self._query_done.emit(None, str(e))
+
+    def _handle_wh_connect_result(self, df: pd.DataFrame | None, err: str) -> bool:
+        """Handle warehouse connect sentinel results. Returns True if consumed."""
+        if err == "__WH_OK__":
+            self._wh_connected = True
+            self._lbl_wh_status.setText("  Warehouse: connesso")
+            self._lbl_wh_status.setStyleSheet(
+                "font-size:12px; color:#2e7d32; font-weight:bold;"
+            )
+            self._statusbar.showMessage("Warehouse connesso.", 4000)
+            return True
+        if err.startswith("__WH_ERR__"):
+            self._wh_connected = False
+            msg = err[len("__WH_ERR__"):]
+            self._lbl_wh_status.setText("  Warehouse: errore")
+            self._lbl_wh_status.setStyleSheet("font-size:12px; color:red;")
+            QMessageBox.critical(self, "Warehouse", msg)
+            return True
+        return False
+
+    # ── Warehouse query persistence ──
+
+    def _wh_query_snapshot(self) -> dict:
+        """Capture current warehouse form fields."""
+        label = self._txt_wh_label.text().strip()
+        if not label:
+            parts = [
+                self._txt_wh_product.text().strip(),
+                self._txt_wh_station.text().strip(),
+                self._txt_wh_operator.text().strip(),
+                self._txt_wh_serial.text().strip(),
+                self._txt_wh_operation.text().strip(),
+            ]
+            label = " / ".join(p for p in parts if p) or self._cmb_wh_type.currentText()
+        return {
+            "label": label,
+            "query_type": self._cmb_wh_type.currentText(),
+            "product": self._txt_wh_product.text().strip(),
+            "serial": self._txt_wh_serial.text().strip(),
+            "operation": self._txt_wh_operation.text().strip(),
+            "station": self._txt_wh_station.text().strip(),
+            "operator": self._txt_wh_operator.text().strip(),
+            "status": self._cmb_wh_status.currentText(),
+            "top": self._spn_wh_top.value(),
+            "filter_dates": self._chk_wh_dates.isChecked(),
+            "date_from": self._date_wh_from.date().toString("yyyy-MM-dd"),
+            "date_to": self._date_wh_to.date().toString("yyyy-MM-dd"),
+            "latest_passage_only": self._chk_wh_latest.isChecked(),
+            "product_like": self._chk_wh_product_like.isChecked(),
+        }
+
+    def _wh_query_summary(self, q: dict) -> str:
+        bits = [q.get("query_type", "")]
+        for key in ("product", "serial", "operation", "station", "operator", "status"):
+            val = (q.get(key) or "").strip()
+            if val and val != "(tutti)":
+                bits.append(val)
+        if q.get("filter_dates"):
+            bits.append(f"{q.get('date_from', '')}→{q.get('date_to', '')}")
+        return " | ".join(b for b in bits if b)
+
+    def _apply_wh_query(self, q: dict) -> None:
+        """Restore warehouse form from a saved search."""
+        qtype = q.get("query_type", "Operation runs (+ docs)")
+        idx = self._cmb_wh_type.findText(qtype)
+        self._cmb_wh_type.setCurrentIndex(idx if idx >= 0 else 0)
+        self._txt_wh_product.setText(q.get("product", ""))
+        self._txt_wh_serial.setText(q.get("serial", ""))
+        self._txt_wh_operation.setText(q.get("operation", ""))
+        self._txt_wh_station.setText(q.get("station", ""))
+        self._txt_wh_operator.setText(q.get("operator", ""))
+        status = q.get("status", "(tutti)")
+        sidx = self._cmb_wh_status.findText(status)
+        self._cmb_wh_status.setCurrentIndex(sidx if sidx >= 0 else 0)
+        self._spn_wh_top.setValue(int(q.get("top", 10_000) or 0))
+        self._chk_wh_dates.setChecked(bool(q.get("filter_dates", False)))
+        d_from = q.get("date_from") or ""
+        d_to = q.get("date_to") or ""
+        if d_from:
+            self._date_wh_from.setDate(QDate.fromString(d_from, "yyyy-MM-dd"))
+        if d_to:
+            self._date_wh_to.setDate(QDate.fromString(d_to, "yyyy-MM-dd"))
+        self._chk_wh_latest.setChecked(bool(q.get("latest_passage_only", False)))
+        self._chk_wh_product_like.setChecked(bool(q.get("product_like", True)))
+        self._txt_wh_label.setText(q.get("label", ""))
+
+    def _load_saved_warehouse_queries(self) -> None:
+        self._saved_wh_queries: list[dict] = []
+        if _SAVED_WAREHOUSE_FILE.exists():
+            try:
+                data = json.loads(_SAVED_WAREHOUSE_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    self._saved_wh_queries = data
+            except (json.JSONDecodeError, OSError):
+                self._saved_wh_queries = []
+        self._refresh_wh_saved_combo()
+
+    def _persist_warehouse_queries(self) -> None:
+        _SAVED_WAREHOUSE_FILE.write_text(
+            json.dumps(self._saved_wh_queries, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _refresh_wh_saved_combo(self) -> None:
+        self._cmb_wh_saved.blockSignals(True)
+        current = self._cmb_wh_saved.currentIndex()
+        self._cmb_wh_saved.clear()
+        self._cmb_wh_saved.addItem("(nuova ricerca)", -1)
+        for i, q in enumerate(self._saved_wh_queries):
+            label = q.get("label") or self._wh_query_summary(q)
+            self._cmb_wh_saved.addItem(f"{label}  —  {self._wh_query_summary(q)}", i)
+        if 0 <= current < self._cmb_wh_saved.count():
+            self._cmb_wh_saved.setCurrentIndex(current)
+        else:
+            self._cmb_wh_saved.setCurrentIndex(0)
+        self._cmb_wh_saved.blockSignals(False)
+
+    @Slot(int)
+    def _on_wh_saved_selected(self, index: int) -> None:
+        if index <= 0:
+            return
+        data = self._cmb_wh_saved.itemData(index)
+        if data is None or int(data) < 0:
+            return
+        idx = int(data)
+        if 0 <= idx < len(self._saved_wh_queries):
+            self._apply_wh_query(self._saved_wh_queries[idx])
+            self._statusbar.showMessage(
+                f"Ricerca caricata: {self._saved_wh_queries[idx].get('label', '')}",
+                3000,
+            )
+
+    @Slot()
+    def _on_save_warehouse_query(self) -> None:
+        snap = self._wh_query_snapshot()
+        if not any(
+            snap.get(k)
+            for k in ("product", "serial", "operation", "station", "operator")
+        ):
+            QMessageBox.warning(
+                self,
+                "Salva ricerca",
+                "Imposta almeno un filtro (prodotto, serial, operazione, "
+                "stazione o operatore) prima di salvare.",
+            )
+            return
+
+        label = snap["label"]
+        for q in self._saved_wh_queries:
+            if q.get("label") == label:
+                q.clear()
+                q.update(snap)
+                self._persist_warehouse_queries()
+                self._refresh_wh_saved_combo()
+                # Select the updated entry
+                for i in range(self._cmb_wh_saved.count()):
+                    if self._cmb_wh_saved.itemData(i) is not None and int(
+                        self._cmb_wh_saved.itemData(i)
+                    ) >= 0:
+                        qi = self._saved_wh_queries[int(self._cmb_wh_saved.itemData(i))]
+                        if qi.get("label") == label:
+                            self._cmb_wh_saved.setCurrentIndex(i)
+                            break
+                self._statusbar.showMessage(f"Ricerca aggiornata: {label}", 3000)
+                return
+
+        self._saved_wh_queries.append(snap)
+        self._persist_warehouse_queries()
+        self._refresh_wh_saved_combo()
+        self._cmb_wh_saved.setCurrentIndex(self._cmb_wh_saved.count() - 1)
+        self._statusbar.showMessage(f"Ricerca salvata: {label}", 3000)
+
+    @Slot()
+    def _on_del_warehouse_query(self) -> None:
+        index = self._cmb_wh_saved.currentIndex()
+        data = self._cmb_wh_saved.itemData(index) if index >= 0 else None
+        if data is None or int(data) < 0:
+            QMessageBox.warning(
+                self,
+                "Elimina ricerca",
+                "Seleziona una ricerca salvata da eliminare.",
+            )
+            return
+        idx = int(data)
+        q = self._saved_wh_queries[idx]
+        name = q.get("label") or self._wh_query_summary(q)
+        reply = QMessageBox.question(
+            self,
+            "Conferma eliminazione",
+            f"Eliminare la ricerca \"{name}\"?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self._saved_wh_queries.pop(idx)
+            self._persist_warehouse_queries()
+            self._refresh_wh_saved_combo()
+            self._cmb_wh_saved.setCurrentIndex(0)
+            self._statusbar.showMessage(f"Ricerca eliminata: {name}", 3000)
 
     # ── Shortcut persistence ──
 
@@ -1250,6 +1868,7 @@ class MainWindow(QMainWindow):
         self._proxy.clear_filters()
         self._model.set_dataframe(filtered)
         self._compute_uniq()
+        self._refresh_meas_name_filter(filtered)
         self._upd_count()
         self._statusbar.showMessage(
             f"Filtro date: {d_from} → {d_to}  ({len(filtered)} record)", 5000
@@ -1261,6 +1880,7 @@ class MainWindow(QMainWindow):
         self._proxy.clear_filters()
         self._model.set_dataframe(self._current_df)
         self._compute_uniq()
+        self._refresh_meas_name_filter(self._current_df)
         self._upd_count()
         self._lbl_filt.setText("")
         self._statusbar.showMessage(
@@ -1366,6 +1986,10 @@ class MainWindow(QMainWindow):
     def _on_clear(self) -> None:
         self._proxy.clear_filters()
         self._lbl_filt.setText("")
+        if self._cmb_meas_name.isEnabled():
+            self._cmb_meas_name.blockSignals(True)
+            self._cmb_meas_name.setCurrentIndex(0)
+            self._cmb_meas_name.blockSignals(False)
         self._upd_count()
 
     # ── Document download ──
@@ -1386,30 +2010,61 @@ class MainWindow(QMainWindow):
         if self._downloading:
             return
 
-        serial = ""
-        for c in self._current_df.columns:
-            if "serial" in str(c).lower():
-                val = self._current_df.iat[row, self._current_df.columns.get_loc(c)]
-                serial = str(val) if not pd.isna(val) else ""
-                break
+        from warehouse_client import download_url_to_file, is_direct_document_url
 
-        filename_hint = f"documents_{serial}.zip"
+        serial = ""
+        file_hint = ""
+        df = self._model.dataframe
+        if not df.empty and 0 <= row < len(df):
+            for c in df.columns:
+                cl = str(c).lower()
+                val = df.iat[row, df.columns.get_loc(c)]
+                if pd.isna(val):
+                    continue
+                text = str(val)
+                if not serial and "serial" in cl:
+                    serial = text
+                if not file_hint and cl in ("file name", "filename"):
+                    file_hint = text
+
+        if file_hint:
+            filename_hint = file_hint
+        elif serial:
+            filename_hint = f"documents_{serial}"
+        else:
+            filename_hint = "document"
+
+        # Warehouse reports are often .html / compressed blobs, not zip.
+        if is_direct_document_url(url) and "." not in filename_hint:
+            filename_hint += ".bin"
+        elif not is_direct_document_url(url) and not filename_hint.lower().endswith(".zip"):
+            filename_hint += ".zip"
+
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Salva documenti", filename_hint, "ZIP (*.zip);;Tutti (*)"
+            self,
+            "Salva documenti",
+            filename_hint,
+            "Tutti (*);;ZIP (*.zip);;HTML (*.html)",
         )
         if not save_path:
             return
 
         self._downloading = True
-        self._overlay.show_loading(f"Download documenti {serial}…")
+        self._overlay.show_loading(f"Download documenti {serial or ''}…")
+
+        needs_web = not is_direct_document_url(url)
 
         def _do_download():
             try:
-                resp = self._get_client().session.get(url, timeout=120, stream=True)
-                resp.raise_for_status()
-                with open(save_path, "wb") as f:
-                    for chunk in resp.iter_content(8192):
-                        f.write(chunk)
+                session = None
+                if needs_web:
+                    if not self._logged_in:
+                        raise RuntimeError(
+                            "Login Proligent richiesto per scaricare "
+                            "documenti da Shortcut / report web."
+                        )
+                    session = self._get_client().session
+                download_url_to_file(url, save_path, session=session)
                 self._download_finished.emit(save_path, "")
             except Exception as e:
                 self._download_finished.emit("", str(e))
@@ -1526,6 +2181,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         if self._client is not None:
             self._client.close()
+        if self._wh_client is not None:
+            try:
+                self._wh_client.close()
+            except Exception:
+                pass
         super().closeEvent(event)
 
     # ── Export ──

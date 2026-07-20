@@ -1,0 +1,17 @@
+[
+  {
+    "label": "Example FST station",
+    "query_type": "Operation runs (+ docs)",
+    "product": "",
+    "serial": "",
+    "operation": "",
+    "station": "FST",
+    "status": "(tutti)",
+    "top": 10000,
+    "filter_dates": false,
+    "date_from": "2026-01-01",
+    "date_to": "2026-07-20",
+    "latest_passage_only": false,
+    "product_like": true
+  }
+]

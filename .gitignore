@@ -8,3 +8,4 @@ export_*
 .proligent-browser-data-viewer
 logs
 saved_shortcuts.json
+saved_warehouse_queries.json

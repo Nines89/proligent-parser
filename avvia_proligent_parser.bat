@@ -6,19 +6,22 @@ cd /d "%~dp0"
 set LOG_DIR=%~dp0logs
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 
-set LOG_FILE=%LOG_DIR%\launcher_%date:~-4%%date:~3,2%%date:~0,2%.log
+REM Unique log per launch so a previous instance cannot lock the file.
+set LOG_STAMP=%date:~-4%%date:~3,2%%date:~0,2%_%time:~0,2%%time:~3,2%%time:~6,2%_%RANDOM%
+set LOG_STAMP=%LOG_STAMP: =0%
+set LOG_FILE=%LOG_DIR%\launcher_%LOG_STAMP%.log
 
-echo [%date% %time%] Launcher avviato >> "%LOG_FILE%"
+call :log Launcher avviato
 
 REM =========================
 REM Python detection robusta
 REM =========================
 
 if exist "%~dp0.venv\Scripts\python.exe" (
-    echo [%date% %time%] Usando: %~dp0.venv\Scripts\python.exe >> "%LOG_FILE%"
+    call :log Usando: %~dp0.venv\Scripts\python.exe
     "%~dp0.venv\Scripts\python.exe" gui.py >> "%LOG_FILE%" 2>&1
     set EXIT_CODE=%errorlevel%
-    echo [%date% %time%] Exit code: %EXIT_CODE% >> "%LOG_FILE%"
+    call :log Exit code: %EXIT_CODE%
     exit /b %EXIT_CODE%
 )
 
@@ -42,16 +45,21 @@ if %errorlevel%==0 (
     goto :run
 )
 
-echo [%date% %time%] Python NON trovato >> "%LOG_FILE%"
+call :log Python NON trovato
 exit /b 1
 
 :run
-echo [%date% %time%] Usando: %PYTHON_CMD% >> "%LOG_FILE%"
+call :log Usando: %PYTHON_CMD%
 
 %PYTHON_CMD% gui.py >> "%LOG_FILE%" 2>&1
 
 set EXIT_CODE=%errorlevel%
 
-echo [%date% %time%] Exit code: %EXIT_CODE% >> "%LOG_FILE%"
+call :log Exit code: %EXIT_CODE%
 
 exit /b %EXIT_CODE%
+
+:log
+echo [%date% %time%] %* >> "%LOG_FILE%" 2>nul
+echo [%date% %time%] %*
+goto :eof
