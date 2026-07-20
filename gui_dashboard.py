@@ -233,18 +233,24 @@ class DashboardWidget(QWidget):
         if counts:
             series = QPieSeries()
             series.setHoleSize(0.45)
+            # External callouts + leader lines overlap badly when slices
+            # are uneven; legend carries name / count / percentage instead.
+            series.setLabelsVisible(False)
+            total = sum(counts.values()) or 1
             order = ["PASS", "FAIL", "ABORTED"]
             keys = [k for k in order if k in counts]
             keys += [k for k in counts if k not in order]
             for k in keys:
-                sl = series.append(f"{k.title()}  {counts[k]}", counts[k])
+                n = counts[k]
+                pct = n / total * 100
+                sl = series.append(f"{k.title()}  {n}  ({pct:.1f}%)", n)
                 sl.setBrush(QColor(_STATUS_COLORS.get(k, "#90a4ae")))
-                sl.setLabelVisible(True)
-                sl.setLabelColor(QColor("#37474f"))
+                sl.setLabelVisible(False)
             chart.addSeries(series)
             chart.legend().setVisible(True)
             chart.legend().setAlignment(Qt.AlignBottom)
             chart.legend().setLabelColor(QColor("#37474f"))
+            chart.legend().setFont(QFont(FONT_FAMILY, 9))
         else:
             chart.legend().setVisible(False)
         self._chart_status.setChart(chart)
