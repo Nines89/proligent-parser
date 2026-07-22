@@ -1,8 +1,15 @@
 # Proligent Parser
 
-Applicazione per interrogare **Proligent Analytics** (report di produzione/test), scaricare i dati in tabella e analizzarli tramite interfaccia grafica o riga di comando.
+Applicazione per interrogare **Proligent Analytics** (report di produzione/test) e il **data warehouse SQL** Proligent, scaricare i dati in tabella e analizzarli tramite interfaccia grafica o riga di comando.
 
-Il programma si connette al portale aziendale Proligent, effettua il login con le credenziali Microsoft aziendali e recupera i report come `pandas DataFrame`, con supporto per filtri, paginazione automatica, shortcut salvati, export CSV, dashboard e download documenti.
+Il programma offre **due percorsi di accesso ai dati**:
+
+| Percorso | Quando usarlo | Autenticazione |
+|---|---|---|
+| **Shortcut UUID** (API web / SSRS) | Report salvati sul portale, layout Proligent | Login Microsoft (Edge / Playwright) |
+| **Warehouse DB** (SQL Server) | Estrazioni massive (migliaia di righe), measurements, filtri operatore | Windows Authentication (ODBC) |
+
+I risultati arrivano come `pandas DataFrame`, con filtri, export CSV, dashboard, download documenti e ricerche/shortcut salvati in locale.
 
 ---
 
@@ -15,8 +22,8 @@ Il programma si connette al portale aziendale Proligent, effettua il login con l
 5. [Launcher (`launch.vbs`)](#launcher-launchvbs)
 6. [Login](#login)
 7. [Shortcut UUID](#shortcut-uuid)
-8. [Interfaccia grafica (GUI)](#interfaccia-grafica-gui)
-9. [Riga di comando (CLI)](#riga-di-comando-cli)
+8. [Warehouse DB](#warehouse-db)
+9. [Interfaccia grafica (GUI)](#interfaccia-grafica-gui)
 10. [Uso come libreria Python](#uso-come-libreria-python)
 11. [Struttura del progetto](#struttura-del-progetto)
 12. [Risoluzione problemi](#risoluzione-problemi)
@@ -30,8 +37,9 @@ Il programma si connette al portale aziendale Proligent, effettua il login con l
 | Componente | Versione minima | Note |
 |---|---|---|
 | **Python** | 3.10+ | Consigliato 3.11 o superiore |
-| **Microsoft Edge** | Qualsiasi versione recente | Obbligatorio: il login usa Edge tramite Playwright |
-| **Rete aziendale** | VPN / intranet | Accesso al server Proligent (vedi sotto) |
+| **Microsoft Edge** | Qualsiasi versione recente | Obbligatorio per il percorso Shortcut (login Playwright) |
+| **SQL Server ODBC driver** | Qualsiasi driver compatibile | Obbligatorio per il tab **Warehouse DB** |
+| **Rete aziendale** | VPN / intranet | Accesso al server Proligent e al warehouse `PROLIGENT_DW` |
 
 ### Dipendenze Python
 
@@ -43,14 +51,18 @@ Le dipendenze sono elencate in `requirements.txt`:
 - `beautifulsoup4`, `lxml` — parsing HTML dei report SSRS
 - `PySide6` — interfaccia grafica
 - `rich` — output formattato da riga di comando
+- `pyodbc` — accesso ODBC al data warehouse (tab Warehouse DB)
+- `proligent_db_sdk` — SDK warehouse (installazione separata, vedi [Installazione](#installazione))
 
 ### Server Proligent
 
-Il client si connette di default a:
+Il client web si connette di default a:
 
 ```
 https://us70uwapp136.zam.alcatel-lucent.com:6443/Analytics
 ```
+
+Il warehouse SQL (SDK) usa lo stesso host con database `PROLIGENT_DW` via ODBC.
 
 È necessario essere raggiungibili da rete aziendale (VPN o rete locale Nokia/Alcatel-Lucent).
 
@@ -104,7 +116,29 @@ py -3 -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 4. Installare i browser Playwright
+### 4. Installare il SDK warehouse (per il tab Warehouse DB)
+
+Il tab **Warehouse DB** richiede il package dal gitlab aziendale, raggiungibile al seguente link:
+
+https://gitlabe1.ext.net.nokia.com/factory-data-lab/sdks/proligent_db_sdk
+
+per installare:
+
+
+```powershell
+pip install git+https://gitlabe1.ext.net.nokia.com/pyapi/proligent_db_sdk.git
+```
+
+Alla richiesta di username e password potete inserire i vostri dati aziendali:
+
+user: surname
+pass: *****
+
+Serve anche un **SQL Server ODBC driver** installato su Windows e raggiungibilità di rete verso `PROLIGENT_DW` - questo dovrebbe essere attivo per tutti gli account Nokia.
+
+> Se l'SDK non è installato, Shortcut UUID continua a funzionare; solo il percorso Warehouse non sarà disponibile.
+
+### 5. Installare i browser Playwright
 
 Playwright usa il canale **msedge** (Microsoft Edge già installato sul sistema). Installare i componenti Playwright:
 
@@ -114,7 +148,7 @@ playwright install
 
 > **Nota:** Edge deve essere già presente su Windows. Il programma lo individua automaticamente in `Program Files` o `LocalAppData`.
 
-### 5. Creare il file degli shortcut (obbligatorio al primo avvio)
+### 6. Creare il file degli shortcut (obbligatorio al primo avvio)
 
 Il repository **non** include `saved_shortcuts.json` (è personale e ignorato da Git). Devi crearlo tu una sola volta, partendo dall'esempio:
 
@@ -129,6 +163,8 @@ Copy-Item saved_shortcuts.example.json saved_shortcuts.json
 4. Salva il file. Da questo momento la GUI userà e aggiornerà automaticamente `saved_shortcuts.json`.
 
 > **Importante:** non modificare né committare `saved_shortcuts.example.json` con i tuoi dati reali. Quello resta solo come modello per gli altri utenti. I tuoi shortcut vanno solo in `saved_shortcuts.json`.
+
+Le ricerche Warehouse salvate usano lo stesso schema: copia opzionale da `saved_warehouse_queries.example.json` → `saved_warehouse_queries.json`, oppure crea le ricerche direttamente dalla GUI (il file viene creato al primo **Salva**).
 
 ---
 
@@ -205,13 +241,11 @@ Se Python non è installato o non è nel `PATH`, il batch termina con errore e l
 
 ### File di log
 
-Ogni avvio produce un file in `logs/` con nome:
+Ogni avvio produce un file **univoco** in `logs/` (data + ora + random), così un'istanza già aperta non blocca i lanci successivi:
 
 ```
-launcher_AAAAMMGG.log
+launcher_AAAAMMGG_HHMMSS_NNNN.log
 ```
-
-Esempio: `launcher_20260713.log` per il 13 luglio 2026.
 
 Il log contiene:
 
@@ -341,7 +375,7 @@ Due file diversi — non confonderli:
 
 **Cosa fare al primo utilizzo**
 
-1. Se non hai ancora `saved_shortcuts.json`, crealo come descritto in [Installazione §5](#5-creare-il-file-degli-shortcut-obbligatorio-al-primo-avvio):
+1. Se non hai ancora `saved_shortcuts.json`, crealo come descritto in [Installazione §6](#6-creare-il-file-degli-shortcut-obbligatorio-al-primo-avvio):
    ```powershell
    Copy-Item saved_shortcuts.example.json saved_shortcuts.json
    ```
@@ -375,6 +409,76 @@ Gli shortcut con molte pagine di risultati vengono scaricati automaticamente: il
 
 ---
 
+## Warehouse DB
+
+Il tab **Warehouse DB** interroga direttamente il data warehouse (database) SQL (`PROLIGENT_DW`) tramite `proligent_db_sdk` / ODBC. È il percorso consigliato per **migliaia di record**, perché evita il rendering SSRS e la paginazione Discovery.
+
+### Prerequisiti
+
+1. `pip install "..\proligent_db_sdk-master.git"` (vedi [Installazione Warehouse](#4-installare-il-sdk-warehouse-per-il-tab-warehouse-db))
+2. Driver ODBC SQL Server installato - teoricamente raggiungibile di default su tutte le macchine
+3. Rete/VPN verso il server warehouse
+4. Account Windows con permesso di lettura sul database (Trusted Connection)
+
+**Non** richiede il pulsante **Login Proligent** (sessione web). Il login web resta necessario solo per Shortcut e per Unit Results View.
+
+### Tipi di query
+
+| Tipo | Contenuto tipico |
+|---|---|
+| **Operation runs (+ docs)** | Run di operazione + link documenti (Test Report / Compressed Report) |
+| **Measurements** | Estratto misure (include colonna `MeasurementName`) |
+
+### Filtri disponibili (Operation runs)
+
+| Campo | Note |
+|---|---|
+| Prodotto | Exact o LIKE (checkbox **Prodotto LIKE**) |
+| Serial | Exact |
+| Operazione | Exact (es. `08000 - FUNCTIONAL TEST`) |
+| Stazione | Partial match su `Location + Station` |
+| **Operatore** | Partial match su colonna `[Operator]` (filtro SQL dedicato) |
+| Status | PASS / FAIL / ABORTED / tutti |
+| Max righe | Default 10 000; `0` = illimitato |
+| Filtra per data | **Off di default** → tutte le date disponibili; attiva solo se serve un intervallo |
+| Solo ultimo passaggio | Una riga per serial (passage order massimo) |
+
+Serve **almeno un** filtro tra prodotto, serial, operazione, stazione o operatore (per evitare scan enormi).
+
+### Ricerche salvate
+
+Come per gli shortcut, è possibile salvare le combinazioni di filtri:
+
+| Azione | Come |
+|---|---|
+| **Salvare** | Compilare i filtri (+ nome opzionale) → **Salva** |
+| **Ricaricare** | Selezionare una voce dal menu **Ricerche salvate** |
+| **Eliminare** | Selezionare la ricerca → **Elimina** |
+
+File locali:
+
+| File | Ruolo |
+|---|---|
+| `saved_warehouse_queries.example.json` | Modello nel repository |
+| `saved_warehouse_queries.json` | Ricerche personali (gitignored) |
+
+### Download documenti (Warehouse)
+
+I link warehouse puntano a `DocumentIntegrationService` e si scaricano **direttamente** (senza sessione web). Nella griglia: click su **Documents** oppure click destro → *Scarica documenti*.
+
+### MeasurementName (dopo la ricerca)
+
+Dopo una query **Measurements**, la barra superiore abilita il filtro **MeasurementName**:
+
+- elenco popolato con i valori **univoci letti dalla query**
+- combo con autocompletamento (una misura)
+- **Seleziona…** per multi-selezione
+- **Tutti i meas.** per rimuovere il filtro
+
+Il controllo resta disabilitato finché il risultato non contiene la colonna `MeasurementName`.
+
+---
+
 ## Interfaccia grafica (GUI)
 
 ### Panoramica
@@ -383,11 +487,11 @@ Gli shortcut con molte pagine di risultati vengono scaricati automaticamente: il
 ┌─────────────────────────────────────────────────────────┐
 │  [Login Proligent]   Stato: Connesso                    │
 ├─────────────────────────────────────────────────────────┤
-│  Tab: Shortcut UUID                                     │
-│  [UUID ▼]  [Carica]   Nome: [____] [Salva] [Elimina]   │
+│  Tab: [ Shortcut UUID ]  [ Warehouse DB ]               │
+│  … filtri / Carica oppure Connetti DB + Esegui …        │
 ├─────────────────────────────────────────────────────────┤
-│  Da: [date]  A: [date]  [Filtra date] [Tutte]          │
-│  [Ultime 24h] [Ultima settimana] [Ultimo mese]         │
+│  Da: [date]  A: [date]  [Filtra date] [Tutte] …         │
+│  MeasurementName: [▼]  [Seleziona…] [Tutti i meas.]     │
 ├─────────────────────────────────────────────────────────┤
 │  [Rimuovi filtri griglia]              [Esporta CSV]    │
 ├─────────────────────────────────────────────────────────┤
@@ -398,9 +502,13 @@ Gli shortcut con molte pagine di risultati vengono scaricati automaticamente: il
 └─────────────────────────────────────────────────────────┘
 ```
 
-### Campo Shortcut UUID
+### Tab Shortcut UUID
 
-È il metodo principale per caricare dati: si incolla o si seleziona l'UUID di uno shortcut Proligent e si clicca **Carica**.
+Metodo basato sul portale: si incolla o si seleziona l'UUID di uno shortcut Proligent e si clicca **Carica** (richiede **Login Proligent**).
+
+### Tab Warehouse DB
+
+Metodo SQL diretto: **Connetti DB** (Windows auth) → impostare i filtri → **Esegui Warehouse**. Dettagli in [Warehouse DB](#warehouse-db).
 
 ### Filtri per data (barra superiore)
 
@@ -436,10 +544,17 @@ Dopo aver caricato i dati, è possibile restringere il periodo **sui dati già i
 
 #### Download documenti
 
-Se la colonna **Documents** contiene un valore (non `0`), il testo appare come link blu sottolineato:
+Se la colonna **Documents** contiene un valore (non `0` / vuoto), il testo appare come link blu sottolineato:
 
-- **Click sinistro** sulla cella Documents → scarica lo ZIP dei documenti associati al test.
+- **Click sinistro** sulla cella Documents → scarica il documento associato.
 - **Click destro** → *Scarica documenti*.
+
+Comportamento in base alla sorgente:
+
+| Sorgente | URL tipico | Autenticazione |
+|---|---|---|
+| Shortcut / report web | `/api/documents?...` | Serve **Login Proligent** (cookie di sessione) |
+| Warehouse DB | `DocumentIntegrationService/.../GetDocument` | Download diretto (nessun login web) |
 
 #### Unit Results View
 
@@ -469,6 +584,8 @@ Vengono esportate **solo le righe visibili** (rispettando filtri griglia e data)
 
 ## Uso come libreria Python
 
+### Client web (Shortcut / report SSRS)
+
 ```python
 from proligent_client import ProligentClient
 
@@ -496,23 +613,51 @@ config = client.get_report_config("OperationRuns")
 print(df)
 ```
 
+### Client warehouse (SQL)
+
+```python
+from warehouse_client import WarehouseClient
+
+wh = WarehouseClient()
+wh.connect()  # Windows Authentication
+
+df_runs = wh.fetch_operation_runs(
+    product="3TL04228AA",
+    operator="12345",
+    top=10_000,
+)
+
+df_meas = wh.fetch_measurements(
+    product="3TL04228AA",
+    date_from="2026-06-01",
+    date_to="2026-06-30",
+)
+
+wh.close()
+print(df_runs)
+```
+
 ---
 
 ## Struttura del progetto
 
 ```
 proligent-parser/
-├── launch.vbs                 # Launcher principale (doppio click, avvio silenzioso)
-├── avvia_proligent_parser.bat # Script batch: trova Python, avvia GUI, scrive log
-├── proligent_client.py        # Client API: login, query, paginazione, download
-├── gui.py                     # Interfaccia grafica PySide6
-├── main.py                    # Entry point riga di comando
-├── requirements.txt           # Dipendenze Python
-├── saved_shortcuts.example.json  # Esempio di shortcut UUID (committato)
-├── saved_shortcuts.json          # Shortcut locali dell'utente (gitignored)
-├── .proligent-browser-data/       # Profilo Edge (sessione, cookie) — generato
-├── .proligent-browser-data-viewer/  # Profilo Edge per Unit Results View
-└── logs/                      # Log giornalieri del launcher (launcher_AAAAMMGG.log)
+├── launch.vbs                      # Launcher principale (doppio click, avvio silenzioso)
+├── avvia_proligent_parser.bat      # Script batch: trova Python, avvia GUI, scrive log
+├── proligent_client.py             # Client API web: login, query, paginazione, download
+├── warehouse_client.py             # Client warehouse SQL (proligent_db_sdk / ODBC)
+├── gui.py                          # Interfaccia grafica PySide6
+├── gui_dashboard.py                # Dashboard KPI / grafici
+├── main.py                         # Entry point riga di comando
+├── requirements.txt                # Dipendenze Python
+├── saved_shortcuts.example.json    # Esempio shortcut UUID (committato)
+├── saved_shortcuts.json            # Shortcut locali (gitignored)
+├── saved_warehouse_queries.example.json  # Esempio ricerche warehouse (committato)
+├── saved_warehouse_queries.json    # Ricerche warehouse locali (gitignored)
+├── .proligent-browser-data/        # Profilo Edge (sessione, cookie) — generato
+├── .proligent-browser-data-viewer/ # Profilo Edge per Unit Results View
+└── logs/                           # Log del launcher (un file per avvio)
 ```
 
 ---
@@ -562,6 +707,19 @@ Il client disabilita la verifica SSL (`verify=False`) perché il server Proligen
 
 Gli shortcut con molte pagine richiedono la navigazione automatica di ogni pagina Discovery. L'overlay nella GUI mostra l'avanzamento (*Raccolta pagina X di Y…*). Attendere il completamento.
 
+Per volumi grandi preferire il tab **Warehouse DB**, di solito molto più veloce.
+
+### "The process cannot access the file because it is being used by another process"
+
+Di solito un'istanza precedente di `gui.py` è ancora aperta e teneva bloccato il log. Chiudere le finestre Proligent Parser (o terminare i processi `python … gui.py`) e rilanciare. Il launcher ora scrive un log univoco per ogni avvio per ridurre il problema.
+
+### Warehouse: errore di connessione / `proligent_db_sdk is not installed`
+
+1. Verificare: `pip install "..\proligent_db_sdk-master.git"` nell'ambiente virtuale del progetto.
+2. Verificare che esista un driver ODBC SQL Server (`pyodbc.drivers()` da Python).
+3. Verificare VPN / rete verso il server warehouse.
+4. Shortcut UUID non dipende dal warehouse: si può continuare a usare il percorso web.
+
 ### Manca `saved_shortcuts.json` / shortcut non compaiono nel menu
 
 Il file non è incluso nel repository: ogni utente deve crearlo in locale.
@@ -574,11 +732,13 @@ Il file non è incluso nel repository: ogni utente deve crearlo in locale.
 3. Riavvia la GUI: gli shortcut (se presenti nel file) appariranno nel menu a tendina.
 4. Se il file esiste ma non si aggiorna, verifica i permessi di scrittura sulla cartella del progetto.
 
+Lo stesso vale per `saved_warehouse_queries.json` (ricerche Warehouse): può essere creato dalla GUI al primo **Salva**, oppure copiato da `saved_warehouse_queries.example.json`.
+
 ---
 
 ## Note legali e sicurezza
 
 - Le credenziali **non** vengono salvate nel codice sorgente.
 - I cookie di sessione restano nel profilo locale `.proligent-browser-data/`.
-- Non condividere il profilo browser né il file `saved_shortcuts.json` se contengono dati sensibili di produzione.
+- Non condividere il profilo browser né i file `saved_shortcuts.json` / `saved_warehouse_queries.json` se contengono dati sensibili di produzione.
 - L'uso del tool è soggetto alle policy IT aziendali e ai termini di utilizzo di Proligent Analytics.
