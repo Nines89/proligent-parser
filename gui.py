@@ -169,8 +169,14 @@ if __name__ == "__main__":
     _STARTUP_SPLASH.show()
     _app.processEvents()
 
+import io
+import importlib.util
 import json
+import re
 import threading
+import time
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -183,10 +189,20 @@ from PySide6.QtCore import (
     QSortFilterProxyModel,
     Qt,
     QTimer,
+    QUrl,
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QFont,
+    QPainter,
+    QPen,
+    QPixmap,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -214,12 +230,21 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QTabWidget,
     QTableView,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 _SAVED_SHORTCUTS_FILE = Path(__file__).parent / "saved_shortcuts.json"
 _SAVED_WAREHOUSE_FILE = Path(__file__).parent / "saved_warehouse_queries.json"
+
+from automations_lib import (
+    create_automation,
+    delete_automation,
+    ensure_dirs,
+    list_automations,
+    list_plot_images,
+)
 
 FONT_FAMILY = "Segoe UI"
 FONT_SIZE_TABLE = 13
@@ -539,6 +564,241 @@ class FilterDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# New automation dialog
+# ---------------------------------------------------------------------------
+
+class NewAutomationDialog(QDialog):
+    """Ask for automation name and optional bulk document download."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Nuova automazione")
+        self.setMinimumWidth(460)
+        self.setStyleSheet("background:#fafafa; color:#212121;")
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        lbl = QLabel("Nome dell'automazione")
+        lbl.setStyleSheet("font-size:13px; color:#424242;")
+        lay.addWidget(lbl)
+
+        self._name = QLineEdit()
+        self._name.setPlaceholderText("es. Analisi yield")
+        self._name.setStyleSheet(
+            "font-size:14px; padding:8px; color:#212121; background:white;"
+        )
+        lay.addWidget(self._name)
+
+        self._chk_download = QCheckBox(
+            "Scarica i file per tutti i report del DataFrame filtrato"
+        )
+        self._chk_download.setStyleSheet("font-size:13px; color:#424242;")
+        self._chk_download.setToolTip(
+            "Se attivo, dopo la creazione vengono scaricati in files/ "
+            "tutti i documenti collegati alle righe visibili in Dati."
+        )
+        lay.addWidget(self._chk_download)
+
+        hint = QLabel(
+            "I file finiscono in automations/<nome>/files/. "
+            "Serve Login Proligent se i link sono da Shortcut / report web."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size:11px; color:#9e9e9e;")
+        lay.addWidget(hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+        self._name.setFocus()
+
+    def automation_name(self) -> str:
+        return self._name.text().strip()
+
+    def download_documents(self) -> bool:
+        return self._chk_download.isChecked()
+
+
+# ---------------------------------------------------------------------------
+# Bulk document download progress
+# ---------------------------------------------------------------------------
+
+class BulkDownloadDialog(QDialog):
+    """Progress UI for downloading many report documents."""
+
+    def __init__(
+        self,
+        total: int,
+        dest: Path,
+        parent=None,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Download documenti")
+        self.setMinimumWidth(520)
+        self.setModal(True)
+        self.setStyleSheet("background:#fafafa; color:#212121;")
+        self._cancelled = False
+        self._cancel_event = cancel_event
+        self._total = max(total, 1)
+        self._t0 = time.monotonic()
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        self._lbl_title = QLabel(f"Download di {total} documenti…")
+        self._lbl_title.setStyleSheet(
+            "font-size:15px; font-weight:bold; color:#1565c0;"
+        )
+        lay.addWidget(self._lbl_title)
+
+        self._lbl_dest = QLabel(f"Destinazione: {dest}")
+        self._lbl_dest.setWordWrap(True)
+        self._lbl_dest.setStyleSheet("font-size:11px; color:#9e9e9e;")
+        self._lbl_dest.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self._lbl_dest)
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, total)
+        self._bar.setValue(0)
+        self._bar.setTextVisible(True)
+        self._bar.setFormat("%v / %m")
+        self._bar.setStyleSheet(
+            "QProgressBar { border:1px solid #bdbdbd; border-radius:4px;"
+            " background:white; height:22px; text-align:center; }"
+            "QProgressBar::chunk { background:#1565c0; border-radius:3px; }"
+        )
+        lay.addWidget(self._bar)
+
+        self._lbl_status = QLabel("Preparazione…")
+        self._lbl_status.setWordWrap(True)
+        self._lbl_status.setStyleSheet("font-size:13px; color:#424242;")
+        lay.addWidget(self._lbl_status)
+
+        self._lbl_eta = QLabel("Tempo rimanente: calcolo…")
+        self._lbl_eta.setStyleSheet("font-size:12px; color:#616161;")
+        lay.addWidget(self._lbl_eta)
+
+        self._lbl_stats = QLabel("Completati: 0  ·  Errori: 0")
+        self._lbl_stats.setStyleSheet("font-size:12px; color:#616161;")
+        lay.addWidget(self._lbl_stats)
+
+        btns = QDialogButtonBox()
+        self._btn_cancel = btns.addButton(QDialogButtonBox.Cancel)
+        self._btn_cancel.clicked.connect(self._on_cancel)
+        lay.addWidget(btns)
+        self._btns = btns
+
+    def _on_cancel(self) -> None:
+        self._cancelled = True
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self._lbl_status.setText("Annullamento in corso (al termine del file attuale)…")
+        self._btn_cancel.setEnabled(False)
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        if seconds < 0 or seconds != seconds:  # NaN
+            return "—"
+        s = int(round(seconds))
+        if s < 60:
+            return f"{s}s"
+        m, s = divmod(s, 60)
+        if m < 60:
+            return f"{m}m {s:02d}s"
+        h, m = divmod(m, 60)
+        return f"{h}h {m:02d}m"
+
+    def update_progress(
+        self,
+        done: int,
+        total: int,
+        *,
+        current: str = "",
+        ok: int = 0,
+        failed: int = 0,
+        eta_seconds: float | None = None,
+    ) -> None:
+        self._bar.setMaximum(max(total, 1))
+        self._bar.setValue(min(done, total))
+        elapsed = time.monotonic() - self._t0
+        if current:
+            self._lbl_status.setText(f"Scaricando: {current}")
+        self._lbl_stats.setText(
+            f"Completati: {ok}  ·  Errori: {failed}  ·  "
+            f"Trascorsi: {self._fmt_duration(elapsed)}"
+        )
+        if eta_seconds is None:
+            self._lbl_eta.setText("Tempo rimanente: calcolo…")
+        else:
+            self._lbl_eta.setText(
+                f"Tempo rimanente: {self._fmt_duration(eta_seconds)}"
+            )
+
+    def mark_finished(self, ok: int, failed: int, cancelled: bool) -> None:
+        elapsed = time.monotonic() - self._t0
+        self._bar.setValue(self._bar.maximum())
+        if cancelled:
+            self._lbl_title.setText("Download interrotto")
+            self._lbl_status.setText(
+                f"Annullato dall'utente dopo {ok + failed} file."
+            )
+        elif failed:
+            self._lbl_title.setText("Download completato con errori")
+            self._lbl_status.setText(
+                f"Salvati {ok} file, {failed} errori."
+            )
+        else:
+            self._lbl_title.setText("Download completato")
+            self._lbl_status.setText(f"Tutti i {ok} file sono stati salvati.")
+        self._lbl_eta.setText(f"Tempo totale: {self._fmt_duration(elapsed)}")
+        self._lbl_stats.setText(f"Completati: {ok}  ·  Errori: {failed}")
+        self._btns.clear()
+        close_btn = self._btns.addButton(QDialogButtonBox.Ok)
+        close_btn.clicked.connect(self.accept)
+
+
+# ---------------------------------------------------------------------------
+# Automation plot thumbnail
+# ---------------------------------------------------------------------------
+
+class ClickablePlotLabel(QLabel):
+    """Thumbnail that opens the image file on double-click."""
+
+    def __init__(self, path: Path, parent=None) -> None:
+        super().__init__(parent)
+        self._path = Path(path)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(f"Doppio click per aprire:\n{self._path}")
+        self.setStyleSheet(
+            "QLabel { background:white; border:1px solid #bdbdbd;"
+            " border-radius:4px; padding:4px; }"
+        )
+        pix = QPixmap(str(self._path))
+        if not pix.isNull():
+            self.setPixmap(
+                pix.scaled(280, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+        else:
+            self.setText(self._path.name)
+            self.setMinimumSize(160, 100)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._path.resolve())))
+        super().mouseDoubleClickEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -547,6 +807,10 @@ class MainWindow(QMainWindow):
     _login_done = Signal(bool, str)
     _query_done = Signal(object, str)
     _progress_msg = Signal(str)
+    _bulk_dl_progress = Signal(int, int, str, int, int, float)
+    _bulk_dl_finished = Signal(int, int, bool)
+    # slug, stdout, stderr, traceback, new_image_paths (list[str])
+    _automation_run_done = Signal(str, str, str, str, object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -558,14 +822,21 @@ class MainWindow(QMainWindow):
         self._logged_in = False
         self._wh_connected = False
         self._downloading = False
+        self._bulk_dlg: BulkDownloadDialog | None = None
+        self._bulk_cancel = threading.Event()
         self._current_df = pd.DataFrame()
         self._col_uniq: dict[int, list[str]] = {}
         self._meas_names: list[str] = []
         self._meas_col_idx: int | None = None
+        self._last_result_tab = 0
+        # slug -> automation info (tabs are discovered from automations/* folders)
+        self._automation_tabs: dict[str, dict[str, Any]] = {}
 
         self._build_ui()
         self._overlay = LoadingOverlay(self.centralWidget())
+        self._load_existing_automations()
         self._connect()
+        ensure_dirs()
 
     def _build_ui(self) -> None:
         c = QWidget()
@@ -804,6 +1075,8 @@ class MainWindow(QMainWindow):
         self._txt_wh_station.setPlaceholderText("location / station (partial OK)")
         self._txt_wh_operator = QLineEdit()
         self._txt_wh_operator.setPlaceholderText("operator id / name (partial OK)")
+        self._txt_wh_measurement = QLineEdit()
+        self._txt_wh_measurement.setPlaceholderText("MeasurementName (solo Measurements)")
         self._cmb_wh_status = QComboBox()
         self._cmb_wh_status.addItems(["(tutti)", "PASS", "FAIL", "ABORTED"])
         self._spn_wh_top = QSpinBox()
@@ -817,7 +1090,7 @@ class MainWindow(QMainWindow):
         for w in (
             self._cmb_wh_type, self._txt_wh_product, self._txt_wh_serial,
             self._txt_wh_operation, self._txt_wh_station, self._txt_wh_operator,
-            self._cmb_wh_status, self._spn_wh_top,
+            self._txt_wh_measurement, self._cmb_wh_status, self._spn_wh_top,
         ):
             w.setStyleSheet(_WH_FIELD_CSS)
 
@@ -846,6 +1119,7 @@ class MainWindow(QMainWindow):
             (1, 6, "Max righe:", self._spn_wh_top),
             (2, 2, "Data da:", self._date_wh_from),
             (2, 4, "Data a:", self._date_wh_to),
+            (3, 4, "Meas.Name:", self._txt_wh_measurement),
         ]
         for row, col, label, widget in wh_fields:
             lbl = QLabel(label)
@@ -1116,6 +1390,12 @@ class MainWindow(QMainWindow):
             self._dashboard_placeholder, "  Dashboard  "
         )
 
+        # "+" tab: create a custom automation (always last)
+        self._add_tab_placeholder = QWidget()
+        self._add_tab_index = self._result_tabs.addTab(
+            self._add_tab_placeholder, "  +  "
+        )
+
         root.addWidget(self._result_tabs, stretch=1)
 
         # ── Status bar ──
@@ -1154,6 +1434,9 @@ class MainWindow(QMainWindow):
         self._progress_msg.connect(self._overlay.set_message)
         self._download_finished.connect(self._on_download_finished)
         self._unit_view_done.connect(self._on_unit_view_done)
+        self._bulk_dl_progress.connect(self._on_bulk_dl_progress)
+        self._bulk_dl_finished.connect(self._on_bulk_dl_finished)
+        self._automation_run_done.connect(self._on_automation_run_done)
         self._table.horizontalHeader().sectionClicked.connect(self._hdr_click)
         self._table.clicked.connect(self._on_cell_click)
         self._table.customContextMenuRequested.connect(self._ctx_menu)
@@ -1187,6 +1470,759 @@ class MainWindow(QMainWindow):
         self._result_tabs.insertTab(
             self._dashboard_tab_index, self._dashboard, "  Dashboard  "
         )
+
+    def _sync_add_tab_index(self) -> None:
+        """Keep the '+' tab as the last result tab."""
+        self._add_tab_index = self._result_tabs.count() - 1
+
+    @Slot()
+    def _on_add_automation(self) -> None:
+        dlg = NewAutomationDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        name = dlg.automation_name()
+        want_download = dlg.download_documents()
+        if not name:
+            QMessageBox.warning(
+                self, "Nuova automazione", "Inserisci un nome per l'automazione."
+            )
+            return
+        try:
+            info = create_automation(name, download_documents=want_download)
+        except ValueError as e:
+            QMessageBox.warning(self, "Nuova automazione", str(e))
+            return
+        except OSError as e:
+            QMessageBox.critical(
+                self, "Nuova automazione", f"Impossibile creare l'automazione:\n{e}"
+            )
+            return
+
+        self._open_automation_tab(info, select=True, announce=True)
+
+        if want_download:
+            self._start_automation_document_download(info)
+
+    def _collect_document_jobs(self, df: pd.DataFrame) -> list[dict[str, Any]]:
+        """Build download jobs from rows that have a document URL."""
+        if df is None or df.empty or "_download_url" not in df.columns:
+            return []
+
+        serial_col = None
+        for c in df.columns:
+            if "serial" in str(c).lower():
+                serial_col = c
+                break
+
+        file_col = None
+        for preferred in ("file name", "filename", "name"):
+            for c in df.columns:
+                if str(c).lower() == preferred:
+                    file_col = c
+                    break
+            if file_col is not None:
+                break
+
+        jobs: list[dict[str, Any]] = []
+        for pos in range(len(df)):
+            url = df["_download_url"].iat[pos]
+            if pd.isna(url):
+                continue
+            url = str(url).strip()
+            if not url or url.lower() in ("nan", "none", "0"):
+                continue
+
+            serial = ""
+            if serial_col is not None:
+                val = df[serial_col].iat[pos]
+                if not pd.isna(val):
+                    serial = str(val).strip()
+
+            file_hint = ""
+            if file_col is not None:
+                val = df[file_col].iat[pos]
+                if not pd.isna(val):
+                    text = str(val).strip()
+                    if text and text.lower() not in ("download", "0", "nan"):
+                        file_hint = text
+
+            jobs.append({
+                "url": url,
+                "serial": serial,
+                "file_hint": file_hint,
+                "index": pos,
+            })
+        return jobs
+
+    @staticmethod
+    def _safe_filename(text: str, fallback: str = "document") -> str:
+        text = (text or "").strip()
+        text = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", text)
+        text = re.sub(r"\s+", "_", text).strip("._")
+        return (text[:120] if text else fallback) or fallback
+
+    def _expected_document_name(self, job: dict[str, Any], url: str) -> str:
+        from warehouse_client import is_direct_document_url
+
+        if job.get("file_hint"):
+            base = self._safe_filename(str(job["file_hint"]))
+        elif job.get("serial"):
+            base = self._safe_filename(f"documents_{job['serial']}")
+        else:
+            base = f"document_{job['index'] + 1}"
+
+        if "." not in Path(base).name:
+            if is_direct_document_url(url):
+                base += ".bin"
+            else:
+                base += ".zip"
+        return base
+
+    def _job_save_path(self, dest: Path, job: dict[str, Any], url: str) -> Path:
+        """Canonical path for a document (no _2/_3 suffixes)."""
+        return Path(dest) / self._expected_document_name(job, url)
+
+    def _document_already_present(
+        self, dest: Path, job: dict[str, Any], url: str
+    ) -> bool:
+        """True if files_dir already has this report (exact name or same stem)."""
+        dest = Path(dest)
+        if not dest.is_dir():
+            return False
+        expected = self._expected_document_name(job, url)
+        if (dest / expected).is_file():
+            return True
+        stem = Path(expected).stem.lower()
+        serial = str(job.get("serial") or "").strip().lower()
+        for p in dest.iterdir():
+            if not p.is_file():
+                continue
+            name = p.name.lower()
+            pstem = p.stem.lower()
+            if pstem == stem or pstem.startswith(stem + "_"):
+                return True
+            if serial and serial in name:
+                return True
+        return False
+
+    def _start_automation_document_download(
+        self,
+        info: dict[str, Any],
+        *,
+        only_missing: bool = False,
+    ) -> None:
+        if self._downloading:
+            QMessageBox.information(
+                self,
+                "Download in corso",
+                "C'è già un download attivo. Riprova al termine.",
+            )
+            return
+
+        df = self._filtered_df()
+        jobs = self._collect_document_jobs(df)
+        dest = Path(info["files_dir"])
+        dest.mkdir(parents=True, exist_ok=True)
+
+        if only_missing:
+            jobs = [
+                j for j in jobs
+                if not self._document_already_present(dest, j, j["url"])
+            ]
+
+        if not jobs:
+            if only_missing:
+                QMessageBox.information(
+                    self,
+                    "Upload",
+                    "Nessun file nuovo da scaricare: "
+                    "tutti i documenti del DataFrame filtrato "
+                    "sono già presenti in files/.",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Nessun documento",
+                    "Nel DataFrame filtrato non ci sono link documento da scaricare.\n"
+                    "Carica una ricerca Operation runs (con Documents) e riprova.",
+                )
+            return
+
+        from warehouse_client import is_direct_document_url
+
+        needs_web = any(not is_direct_document_url(j["url"]) for j in jobs)
+        if needs_web and not self._logged_in:
+            QMessageBox.warning(
+                self,
+                "Login richiesto",
+                "Alcuni documenti richiedono Login Proligent "
+                "(Shortcut / report web). Effettua il login e riprova.",
+            )
+            return
+
+        self._bulk_cancel.clear()
+        self._bulk_dlg = BulkDownloadDialog(
+            len(jobs), dest, self, cancel_event=self._bulk_cancel
+        )
+        self._downloading = True
+
+        def _do_bulk() -> None:
+            from warehouse_client import download_url_to_file, is_direct_document_url
+
+            ok = 0
+            failed = 0
+            durations: list[float] = []
+            cancelled = False
+            session = None
+            try:
+                if needs_web:
+                    session = self._get_client().session
+            except Exception as e:
+                self._bulk_dl_finished.emit(0, len(jobs), False)
+                self._statusbar.showMessage(f"Errore sessione download: {e}", 8000)
+                return
+
+            for i, job in enumerate(jobs):
+                if self._bulk_cancel.is_set():
+                    cancelled = True
+                    break
+                url = job["url"]
+                label = job.get("serial") or job.get("file_hint") or f"#{job['index'] + 1}"
+                eta = (
+                    (sum(durations) / len(durations)) * (len(jobs) - i)
+                    if durations
+                    else -1.0
+                )
+                self._bulk_dl_progress.emit(
+                    i, len(jobs), str(label), ok, failed, eta
+                )
+                save_path = self._job_save_path(dest, job, url)
+                if save_path.exists():
+                    ok += 1
+                    self._bulk_dl_progress.emit(
+                        i + 1, len(jobs), str(label), ok, failed, eta
+                    )
+                    continue
+                t0 = time.monotonic()
+                try:
+                    use_session = None if is_direct_document_url(url) else session
+                    download_url_to_file(url, str(save_path), session=use_session)
+                    ok += 1
+                except Exception:
+                    failed += 1
+                durations.append(time.monotonic() - t0)
+                eta_after = (
+                    (sum(durations) / len(durations)) * (len(jobs) - i - 1)
+                    if durations
+                    else -1.0
+                )
+                self._bulk_dl_progress.emit(
+                    i + 1, len(jobs), str(label), ok, failed, eta_after
+                )
+
+            self._bulk_dl_finished.emit(ok, failed, cancelled)
+
+        threading.Thread(target=_do_bulk, daemon=True).start()
+        self._bulk_dlg.exec()
+        self._bulk_dlg = None
+
+    @Slot(int, int, str, int, int, float)
+    def _on_bulk_dl_progress(
+        self,
+        done: int,
+        total: int,
+        current: str,
+        ok: int,
+        failed: int,
+        eta: float,
+    ) -> None:
+        if self._bulk_dlg is None:
+            return
+        self._bulk_dlg.update_progress(
+            done,
+            total,
+            current=current,
+            ok=ok,
+            failed=failed,
+            eta_seconds=None if eta < 0 else eta,
+        )
+
+    @Slot(int, int, bool)
+    def _on_bulk_dl_finished(self, ok: int, failed: int, cancelled: bool) -> None:
+        self._downloading = False
+        if self._bulk_dlg is not None:
+            self._bulk_dlg.mark_finished(ok, failed, cancelled)
+        if cancelled:
+            msg = f"Download interrotto: {ok} salvati, {failed} errori"
+        elif failed:
+            msg = f"Download finito: {ok} salvati, {failed} errori"
+        else:
+            msg = f"Download completato: {ok} file salvati"
+        self._statusbar.showMessage(msg, 8000)
+
+    def _load_existing_automations(self) -> None:
+        """Open one result tab for every folder under automations/."""
+        loaded = list_automations()
+        for info in loaded:
+            self._open_automation_tab(info, select=False, announce=False)
+        if loaded:
+            names = ", ".join(i["name"] for i in loaded)
+            self._statusbar.showMessage(
+                f"Automazioni caricate ({len(loaded)}): {names}", 8000
+            )
+
+    def _open_automation_tab(
+        self,
+        info: dict[str, Any],
+        *,
+        select: bool = True,
+        announce: bool = False,
+    ) -> None:
+        name = info["name"]
+        slug = str(info["slug"])
+        script_path: Path = info["script"]
+        root: Path = info["root"]
+        download_docs = bool(info.get("download_documents", False))
+
+        if slug in self._automation_tabs:
+            if select:
+                idx = self._result_tabs.indexOf(self._automation_tabs[slug]["widget"])
+                if idx >= 0:
+                    self._result_tabs.setCurrentIndex(idx)
+            return
+
+        tab = QWidget()
+        tab.setProperty("automation_slug", slug)
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+
+        title = QLabel(name)
+        title.setStyleSheet(
+            "font-size:18px; font-weight:bold; color:#1565c0;"
+        )
+        lay.addWidget(title)
+
+        detail = QLabel(
+            f"Cartella: {root}\n"
+            f"Script:   {script_path}"
+        )
+        detail.setWordWrap(True)
+        detail.setStyleSheet("font-size:12px; color:#9e9e9e;")
+        detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(detail)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        btn_run = QPushButton("  Run  ")
+        btn_run.setStyleSheet(
+            "font-size:13px; font-weight:bold; padding:8px 22px;"
+            "background:#2e7d32; color:white; border:none; border-radius:4px;"
+        )
+        btn_run.setToolTip("Esegue run(df, files_dir) sullo script main.py")
+        btn_run.clicked.connect(lambda: self._on_automation_run(slug))
+        btn_row.addWidget(btn_run)
+
+        btn_upload = None
+        if download_docs:
+            btn_upload = QPushButton("  Upload  ")
+            btn_upload.setStyleSheet(
+                "font-size:13px; font-weight:bold; padding:8px 22px;"
+                "background:#1565c0; color:white; border:none; border-radius:4px;"
+            )
+            btn_upload.setToolTip(
+                "Confronta i documenti del DataFrame filtrato con files/ "
+                "e scarica solo quelli mancanti."
+            )
+            btn_upload.clicked.connect(lambda: self._on_automation_upload(slug))
+            btn_row.addWidget(btn_upload)
+
+        btn_del = QPushButton("  Elimina  ")
+        btn_del.setStyleSheet(
+            "font-size:13px; font-weight:bold; padding:8px 22px;"
+            "background:#c62828; color:white; border:none; border-radius:4px;"
+        )
+        btn_del.setToolTip("Elimina la cartella automazione e chiude questa tab")
+        btn_del.clicked.connect(lambda: self._on_automation_delete(slug))
+        btn_row.addWidget(btn_del)
+
+        btn_open_plots = QPushButton("  Apri plots  ")
+        btn_open_plots.setStyleSheet(
+            "font-size:12px; padding:8px 14px;"
+            "background:#eceff1; color:#37474f; border:1px solid #b0bec5;"
+            " border-radius:4px;"
+        )
+        btn_open_plots.setToolTip("Apre la cartella files/plots nel file manager")
+        btn_open_plots.clicked.connect(lambda: self._on_automation_open_plots(slug))
+        btn_row.addWidget(btn_open_plots)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        log_lbl = QLabel("Output (stdout / stderr)")
+        log_lbl.setStyleSheet("font-size:12px; color:#424242;")
+        lay.addWidget(log_lbl)
+
+        log = QTextEdit()
+        log.setReadOnly(True)
+        log.setAcceptRichText(True)
+        log.setPlaceholderText(
+            "print() → nero · stderr → arancio · errori → rosso · ok → verde"
+        )
+        log.setStyleSheet(
+            "QTextEdit { font-family: Consolas, 'Courier New', monospace;"
+            " font-size:12px; color:#212121; background:#fafafa;"
+            " border:1px solid #bdbdbd; border-radius:4px; padding:6px; }"
+        )
+        lay.addWidget(log, stretch=2)
+
+        plots_hdr = QHBoxLayout()
+        plots_lbl = QLabel("Grafici (files/plots) — doppio click per aprire")
+        plots_lbl.setStyleSheet("font-size:12px; color:#424242;")
+        plots_hdr.addWidget(plots_lbl)
+        plots_hdr.addStretch()
+        lay.addLayout(plots_hdr)
+
+        plots_scroll = QScrollArea()
+        plots_scroll.setWidgetResizable(True)
+        plots_scroll.setMinimumHeight(170)
+        plots_scroll.setStyleSheet(
+            "QScrollArea { border:1px solid #bdbdbd; border-radius:4px;"
+            " background:#eeeeee; }"
+        )
+        plots_host = QWidget()
+        plots_lay = QHBoxLayout(plots_host)
+        plots_lay.setContentsMargins(8, 8, 8, 8)
+        plots_lay.setSpacing(10)
+        plots_empty = QLabel(
+            "Nessun grafico. In main.py usa save_plot(fig, files_dir, \"nome\")."
+        )
+        plots_empty.setStyleSheet("font-size:12px; color:#9e9e9e;")
+        plots_lay.addWidget(plots_empty)
+        plots_lay.addStretch()
+        plots_scroll.setWidget(plots_host)
+        lay.addWidget(plots_scroll, stretch=1)
+
+        # Insert before the '+' tab so '+' stays last
+        self._sync_add_tab_index()
+        idx = self._result_tabs.insertTab(self._add_tab_index, tab, f"  {name}  ")
+        self._sync_add_tab_index()
+        self._automation_tabs[slug] = {
+            **info,
+            "widget": tab,
+            "log": log,
+            "plots_host": plots_host,
+            "plots_lay": plots_lay,
+            "btn_run": btn_run,
+            "btn_upload": btn_upload,
+            "btn_del": btn_del,
+        }
+        self._refresh_automation_plots(slug)
+        if select:
+            self._last_result_tab = idx
+            self._result_tabs.setCurrentIndex(idx)
+        if announce:
+            self._statusbar.showMessage(
+                f"Automazione «{name}» creata → automations/{root.name}/", 6000
+            )
+
+    def _automation_info(self, slug: str) -> dict[str, Any] | None:
+        return self._automation_tabs.get(slug)
+
+    def _append_automation_log(
+        self,
+        slug: str,
+        text: str,
+        *,
+        kind: str = "stdout",
+    ) -> None:
+        meta = self._automation_info(slug)
+        if not meta or not text:
+            return
+        log: QTextEdit = meta["log"]
+        colors = {
+            "info": "#1565c0",
+            "stdout": "#212121",
+            "stderr": "#ef6c00",
+            "error": "#c62828",
+            "ok": "#2e7d32",
+        }
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(colors.get(kind, "#212121")))
+        if kind in ("error", "info", "ok"):
+            fmt.setFontWeight(QFont.Bold)
+        cursor = log.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        # Ensure monospace
+        font = QFont("Consolas", 10)
+        if not font.exactMatch():
+            font = QFont("Courier New", 10)
+        fmt.setFont(font)
+        if not text.endswith("\n"):
+            text = text + "\n"
+        cursor.insertText(text, fmt)
+        log.setTextCursor(cursor)
+        log.ensureCursorVisible()
+
+    def _clear_layout(self, layout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _refresh_automation_plots(self, slug: str) -> None:
+        meta = self._automation_info(slug)
+        if not meta:
+            return
+        layout = meta["plots_lay"]
+        self._clear_layout(layout)
+        images = list_plot_images(Path(meta["files_dir"]))
+        if not images:
+            empty = QLabel(
+                "Nessun grafico. In main.py usa save_plot(fig, files_dir, \"nome\")."
+            )
+            empty.setStyleSheet("font-size:12px; color:#9e9e9e;")
+            layout.addWidget(empty)
+            layout.addStretch()
+            return
+        for path in images:
+            layout.addWidget(ClickablePlotLabel(path))
+        layout.addStretch()
+
+    def _on_automation_open_plots(self, slug: str) -> None:
+        meta = self._automation_info(slug)
+        if not meta:
+            return
+        plots = Path(meta["files_dir"]) / "plots"
+        plots.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(plots.resolve())))
+
+    @Slot()
+    def _on_automation_run(self, slug: str) -> None:
+        meta = self._automation_info(slug)
+        if not meta:
+            return
+        if self._downloading:
+            QMessageBox.information(
+                self, "Occupato", "Attendi la fine del download in corso."
+            )
+            return
+
+        script: Path = meta["script"]
+        if not script.is_file():
+            QMessageBox.warning(
+                self, "Run", f"Script non trovato:\n{script}"
+            )
+            return
+
+        df = self._filtered_df().copy()
+        files_dir = Path(meta["files_dir"])
+        files_dir.mkdir(parents=True, exist_ok=True)
+        (files_dir / "plots").mkdir(parents=True, exist_ok=True)
+
+        meta["log"].clear()
+        self._append_automation_log(
+            slug,
+            f"=== Run «{meta['name']}» — {len(df)} righe filtrate ===",
+            kind="info",
+        )
+        self._overlay.show_loading(f"Esecuzione automazione «{meta['name']}»…")
+        meta["btn_run"].setEnabled(False)
+        if meta.get("btn_upload") is not None:
+            meta["btn_upload"].setEnabled(False)
+        meta["btn_del"].setEnabled(False)
+
+        # Snapshot images before run to highlight new ones
+        before = {p: p.stat().st_mtime for p in list_plot_images(files_dir)}
+
+        def _do_run() -> None:
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            err = ""
+            src_dir = str(script.parent.resolve())
+            path_added = False
+            show_patched = False
+            original_show = None
+            try:
+                if src_dir not in sys.path:
+                    sys.path.insert(0, src_dir)
+                    path_added = True
+
+                # Non-interactive matplotlib + plt.show() → save into files/plots
+                try:
+                    import matplotlib
+
+                    matplotlib.use("Agg", force=True)
+                    import matplotlib.pyplot as plt
+
+                    counter = {"n": 0}
+
+                    def _patched_show(*_a, **_kw):
+                        plots = files_dir / "plots"
+                        plots.mkdir(parents=True, exist_ok=True)
+                        for num in plt.get_fignums():
+                            fig = plt.figure(num)
+                            counter["n"] += 1
+                            out = plots / f"plot_{counter['n']}.png"
+                            fig.savefig(out, dpi=120, bbox_inches="tight")
+                            print(f"[plot saved via plt.show()] {out}")
+                        plt.close("all")
+
+                    original_show = plt.show
+                    plt.show = _patched_show  # type: ignore[assignment]
+                    show_patched = True
+                except ImportError:
+                    pass
+
+                mod_name = f"proligent_automation_{slug}"
+                to_drop = [
+                    k for k in list(sys.modules)
+                    if k == mod_name or k.startswith(mod_name + ".")
+                ]
+                for k, mod in list(sys.modules.items()):
+                    mod_file = getattr(mod, "__file__", None)
+                    if not mod_file:
+                        continue
+                    try:
+                        if Path(mod_file).resolve().parent == Path(src_dir):
+                            to_drop.append(k)
+                    except OSError:
+                        pass
+                for k in set(to_drop):
+                    sys.modules.pop(k, None)
+
+                spec = importlib.util.spec_from_file_location(
+                    mod_name, script, submodule_search_locations=[src_dir]
+                )
+                if spec is None or spec.loader is None:
+                    raise RuntimeError(f"Impossibile caricare {script}")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[mod_name] = module
+                with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                    spec.loader.exec_module(module)
+                    run_fn = getattr(module, "run", None)
+                    if not callable(run_fn):
+                        raise RuntimeError(
+                            "Lo script deve definire una funzione run(df, files_dir)."
+                        )
+                    run_fn(df, files_dir)
+            except Exception:
+                err = traceback.format_exc()
+            finally:
+                if show_patched and original_show is not None:
+                    try:
+                        import matplotlib.pyplot as plt
+
+                        plt.show = original_show
+                    except Exception:
+                        pass
+                if path_added:
+                    try:
+                        sys.path.remove(src_dir)
+                    except ValueError:
+                        pass
+
+            after = list_plot_images(files_dir)
+            new_images = [
+                str(p) for p in after
+                if p not in before or p.stat().st_mtime > before.get(p, 0)
+            ]
+            self._automation_run_done.emit(
+                slug,
+                buf_out.getvalue(),
+                buf_err.getvalue(),
+                err,
+                new_images,
+            )
+
+        threading.Thread(target=_do_run, daemon=True).start()
+
+    @Slot(str, str, str, str, object)
+    def _on_automation_run_done(
+        self,
+        slug: str,
+        stdout: str,
+        stderr: str,
+        err: str,
+        new_images: object,
+    ) -> None:
+        self._overlay.hide_loading()
+        meta = self._automation_info(slug)
+        if meta:
+            meta["btn_run"].setEnabled(True)
+            if meta.get("btn_upload") is not None:
+                meta["btn_upload"].setEnabled(True)
+            meta["btn_del"].setEnabled(True)
+        if stdout.strip():
+            self._append_automation_log(slug, stdout.rstrip(), kind="stdout")
+        if stderr.strip():
+            self._append_automation_log(slug, stderr.rstrip(), kind="stderr")
+        if err:
+            self._append_automation_log(slug, "--- ERROR ---\n" + err.rstrip(), kind="error")
+            QMessageBox.warning(
+                self,
+                "Errore automazione",
+                f"L'automazione «{slug}» ha generato un errore.\n"
+                "Dettagli nel pannello Output.",
+            )
+            self._statusbar.showMessage(f"Automazione «{slug}»: errore", 6000)
+        else:
+            self._append_automation_log(slug, "=== Fine (ok) ===", kind="ok")
+            self._statusbar.showMessage(f"Automazione «{slug}»: completata", 5000)
+
+        self._refresh_automation_plots(slug)
+        imgs = list(new_images) if isinstance(new_images, (list, tuple)) else []
+        if imgs:
+            names = ", ".join(Path(p).name for p in imgs)
+            self._append_automation_log(
+                slug,
+                f"Nuovi grafici ({len(imgs)}): {names}",
+                kind="info",
+            )
+
+    @Slot()
+    def _on_automation_upload(self, slug: str) -> None:
+        meta = self._automation_info(slug)
+        if not meta:
+            return
+        self._start_automation_document_download(meta, only_missing=True)
+
+    @Slot()
+    def _on_automation_delete(self, slug: str) -> None:
+        meta = self._automation_info(slug)
+        if not meta:
+            return
+        name = meta["name"]
+        root = Path(meta["root"])
+        reply = QMessageBox.question(
+            self,
+            "Elimina automazione",
+            f"Eliminare definitivamente l'automazione «{name}»?\n\n"
+            f"Verrà rimossa la cartella:\n{root}",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            delete_automation(root)
+        except (OSError, ValueError) as e:
+            QMessageBox.critical(self, "Elimina automazione", str(e))
+            return
+
+        widget = meta["widget"]
+        idx = self._result_tabs.indexOf(widget)
+        if idx >= 0:
+            was_current = self._result_tabs.currentIndex() == idx
+            self._result_tabs.removeTab(idx)
+            if was_current:
+                self._result_tabs.setCurrentIndex(0)
+                self._last_result_tab = 0
+            elif self._last_result_tab > idx:
+                self._last_result_tab -= 1
+        self._automation_tabs.pop(slug, None)
+        self._sync_add_tab_index()
+        self._statusbar.showMessage(f"Automazione «{name}» eliminata", 5000)
 
     # ── Login ──
 
@@ -1517,12 +2553,13 @@ class MainWindow(QMainWindow):
         operation = self._txt_wh_operation.text().strip()
         station = self._txt_wh_station.text().strip()
         operator = self._txt_wh_operator.text().strip()
-        if not any((product, serial, operation, station, operator)):
+        measurement = self._txt_wh_measurement.text().strip()
+        if not any((product, serial, operation, station, operator, measurement)):
             QMessageBox.warning(
                 self,
                 "Filtri richiesti",
                 "Imposta almeno un filtro (prodotto, serial, operazione, "
-                "stazione o operatore) per evitare estrazioni enormi.",
+                "stazione, operatore o MeasurementName) per evitare estrazioni enormi.",
             )
             return
 
@@ -1551,7 +2588,10 @@ class MainWindow(QMainWindow):
             )
             self._progress_msg.emit("Esecuzione query SQL sul warehouse…")
             if qtype.startswith("Measurements"):
-                df = wh.fetch_measurements(**common)
+                df = wh.fetch_measurements(
+                    **common,
+                    measurement_name=self._txt_wh_measurement.text().strip() or None,
+                )
             else:
                 st = self._cmb_wh_status.currentText().strip()
                 top = self._spn_wh_top.value()
@@ -1598,6 +2638,7 @@ class MainWindow(QMainWindow):
                 self._txt_wh_operator.text().strip(),
                 self._txt_wh_serial.text().strip(),
                 self._txt_wh_operation.text().strip(),
+                self._txt_wh_measurement.text().strip(),
             ]
             label = " / ".join(p for p in parts if p) or self._cmb_wh_type.currentText()
         return {
@@ -1608,6 +2649,7 @@ class MainWindow(QMainWindow):
             "operation": self._txt_wh_operation.text().strip(),
             "station": self._txt_wh_station.text().strip(),
             "operator": self._txt_wh_operator.text().strip(),
+            "measurement_name": self._txt_wh_measurement.text().strip(),
             "status": self._cmb_wh_status.currentText(),
             "top": self._spn_wh_top.value(),
             "filter_dates": self._chk_wh_dates.isChecked(),
@@ -1619,7 +2661,10 @@ class MainWindow(QMainWindow):
 
     def _wh_query_summary(self, q: dict) -> str:
         bits = [q.get("query_type", "")]
-        for key in ("product", "serial", "operation", "station", "operator", "status"):
+        for key in (
+            "product", "serial", "operation", "station", "operator",
+            "measurement_name", "status",
+        ):
             val = (q.get(key) or "").strip()
             if val and val != "(tutti)":
                 bits.append(val)
@@ -1637,6 +2682,7 @@ class MainWindow(QMainWindow):
         self._txt_wh_operation.setText(q.get("operation", ""))
         self._txt_wh_station.setText(q.get("station", ""))
         self._txt_wh_operator.setText(q.get("operator", ""))
+        self._txt_wh_measurement.setText(q.get("measurement_name", ""))
         status = q.get("status", "(tutti)")
         sidx = self._cmb_wh_status.findText(status)
         self._cmb_wh_status.setCurrentIndex(sidx if sidx >= 0 else 0)
@@ -1703,13 +2749,16 @@ class MainWindow(QMainWindow):
         snap = self._wh_query_snapshot()
         if not any(
             snap.get(k)
-            for k in ("product", "serial", "operation", "station", "operator")
+            for k in (
+                "product", "serial", "operation", "station",
+                "operator", "measurement_name",
+            )
         ):
             QMessageBox.warning(
                 self,
                 "Salva ricerca",
                 "Imposta almeno un filtro (prodotto, serial, operazione, "
-                "stazione o operatore) prima di salvare.",
+                "stazione, operatore o MeasurementName) prima di salvare.",
             )
             return
 
@@ -1947,6 +2996,16 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_result_tab_changed(self, index: int) -> None:
+        self._sync_add_tab_index()
+        if index == self._add_tab_index:
+            # Don't stay on '+': restore previous tab, then open the dialog
+            self._result_tabs.blockSignals(True)
+            self._result_tabs.setCurrentIndex(self._last_result_tab)
+            self._result_tabs.blockSignals(False)
+            self._on_add_automation()
+            return
+
+        self._last_result_tab = index
         if index == self._dashboard_tab_index:
             self._ensure_dashboard()
         self._maybe_refresh_dashboard()

@@ -9,3 +9,6 @@ export_*
 logs
 saved_shortcuts.json
 saved_warehouse_queries.json
+
+# User automations (keep automations/ via .gitkeep; ignore personal folders)
+automations/*/

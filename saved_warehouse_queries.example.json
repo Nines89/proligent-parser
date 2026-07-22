@@ -6,6 +6,8 @@
     "serial": "",
     "operation": "",
     "station": "FST",
+    "operator": "",
+    "measurement_name": "",
     "status": "(tutti)",
     "top": 10000,
     "filter_dates": false,

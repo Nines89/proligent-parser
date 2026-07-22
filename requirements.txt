@@ -4,8 +4,9 @@ pandas>=2.0.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 rich>=13.0.0
-PySide6>=6.5.0
-pyodbc>=5.0.0
+matplotlib>=3.7.0
+openpyxl>=3.1.0
+
 
 # Warehouse DB tab (bulk SQL extracts). Install the local SDK once:
 #   pip install -e "..\proligent_db_sdk-master"

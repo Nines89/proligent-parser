@@ -163,7 +163,7 @@ class WarehouseClient:
         except ImportError as exc:
             raise WarehouseError(
                 "proligent_db_sdk is not installed. "
-                f"Install it with: {_DEFAULT_SDK_HINT}"
+                f"Install it with: {_DEFAULT_SDK_HINT} - see the README.md file."
             ) from exc
 
         self.close()
